@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.stock.menubar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/stephen/Desktop/stock_monitor_mac/stock_menubar.py</string>
+    </array>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/Users/stephen/Desktop/stock_monitor_mac/menubar_output.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/stephen/Desktop/stock_monitor_mac/menubar_error.log</string>
+</dict>
+</plist>

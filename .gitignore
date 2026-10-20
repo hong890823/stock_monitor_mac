@@ -1,0 +1,63 @@
+# ── 密钥与本地配置（务必勿提交） ─────────────────────────────
+ai_config.json
+*.key
+*.pem
+.env
+.env.*
+!.env.example
+
+# ── 运行时状态 / 个人数据 ────────────────────────────────────
+# 持仓、自选、交易账本、板块龙头追踪等均为本机私有数据
+portfolio.json
+watchlist.json
+trade_ledger.json
+sector_leaders.json
+*_state.json
+*_cache.json
+
+# 程序运行产物：报告、回测结果、日志缓存
+_*.json
+_*.txt
+_*.log
+
+# 本地数据库
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+*.db
+
+# 进程与锁文件
+.stock_pid
+.stock_menubar.lock
+*.pid
+*.lock
+
+# ── 日志 ─────────────────────────────────────────────────────
+*.log
+*.log.*
+crash.log*
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── 系统 / IDE ───────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.claude/
+*.swp
+*~

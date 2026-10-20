@@ -1,0 +1,342 @@
+#!/bin/bash
+# 股票监控快速启动脚本
+# 仅由本脚本负责自动重启；launchd 配置不再自动拉起同一程序。
+
+# 解析脚本真实路径（支持从符号链接调用，例如 ~/.local/bin/stock）
+SOURCE="${BASH_SOURCE[0]}"
+while [ -L "$SOURCE" ]; do
+    _dir="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+    SOURCE="$(readlink "$SOURCE")"
+    case "$SOURCE" in
+        /*) ;;
+        *) SOURCE="$_dir/$SOURCE" ;;
+    esac
+done
+SCRIPT_DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
+PID_FILE="$SCRIPT_DIR/.stock_pid"
+LOG_FILE="$SCRIPT_DIR/stock_monitor.log"
+CRASH_LOG="$SCRIPT_DIR/crash.log"
+APP_PATH="$SCRIPT_DIR/stock_menubar.py"
+
+# 崩溃退避与熔断：
+#   短时间内反复崩溃才计数（STABLE_RUN_SECONDS 内就挂算一次「快速崩溃」），
+#   跑够时长后崩溃会把计数清零，避免三天崩六次被误熔断。
+STABLE_RUN_SECONDS=120
+MAX_RAPID_CRASHES=6
+LOG_MAX_BYTES=5242880   # 5MB，超过就轮转成 .1
+
+rotate_log() {
+    local path="$1"
+    local max_bytes="${2:-$LOG_MAX_BYTES}"
+    [ -f "$path" ] || return 0
+    local size
+    size=$(wc -c < "$path" | tr -d ' ')
+    if [ "$size" -gt "$max_bytes" ]; then
+        rm -f "${path}.1"
+        mv "$path" "${path}.1"
+    fi
+}
+
+pid_is_running() {
+    [ -f "$PID_FILE" ] || return 1
+    local pid
+    pid="$(tr -d '[:space:]' < "$PID_FILE")"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+# 列出所有相关进程：supervisor(stock _supervise) 与 python 菜单栏程序。
+# PID 文件可能丢失或过期，因此同时用 pgrep 兜底，
+# 否则会出现「进程还活着、脚本却以为没运行」→ restart 变成空操作。
+find_all_pids() {
+    local pid comm base
+    {
+        if [ -f "$PID_FILE" ]; then
+            tr -d '[:space:]' < "$PID_FILE"
+            echo
+        fi
+        pgrep -f "$SCRIPT_DIR/stock _supervise" 2>/dev/null
+        pgrep -f "$APP_PATH" 2>/dev/null
+    } | grep -E '^[0-9]+$' | sort -un | while read -r pid; do
+        [ "$pid" = "$$" ] && continue
+        comm="$(ps -p "$pid" -o comm= 2>/dev/null)"
+        # macOS 的 comm 可能是完整路径（/bin/bash），先取可执行文件名再比
+        base="${comm##*/}"
+        # 只认 bash/python 系进程，避免误杀编辑器等命令行里带同名路径的进程
+        case "$base" in
+            python|python3|python2|Python|Python3|Python2|bash|sh|-bash|-sh|zsh) echo "$pid" ;;
+        esac
+    done
+}
+
+supervisor_pid() {
+    pgrep -f "$SCRIPT_DIR/stock _supervise" 2>/dev/null | head -1
+}
+
+# 只删除属于自己的 PID 记录。
+# 早期版本无条件 rm -f：撞锁退出的 supervisor 会把别的实例的 PID 文件删掉，
+# 导致 status/restart 永远找不到进程，进入无法自愈的死循环。
+cleanup_pid_file() {
+    [ -f "$PID_FILE" ] || return 0
+    local stored
+    stored="$(tr -d '[:space:]' < "$PID_FILE")"
+    if [ "$stored" = "$$" ]; then
+        rm -f "$PID_FILE"
+    fi
+}
+
+supervise() {
+    local child_pid
+    local rapid_crashes=0
+    local backoff_index=0
+    local started_at ran_seconds exit_code delay
+    local backoff_table=(10 30 60 300)
+    # 仅在文件缺失或指向已死进程时登记自己，避免抢掉别的实例的记录
+    if ! pid_is_running; then
+        echo $$ > "$PID_FILE"
+    fi
+    trap cleanup_pid_file EXIT
+    trap 'if [ -n "$child_pid" ]; then kill -TERM "$child_pid" 2>/dev/null; wait "$child_pid" 2>/dev/null; fi; exit 0' TERM INT HUP
+
+    while true; do
+        rotate_log "$LOG_FILE"
+        echo "[$(date)] 程序启动" >> "$LOG_FILE"
+
+        started_at=$(date +%s)
+        python3 "$APP_PATH" 2>> "$CRASH_LOG" &
+        child_pid=$!
+        wait "$child_pid"
+        exit_code=$?
+        child_pid=""
+        ran_seconds=$(( $(date +%s) - started_at ))
+
+        if [ "$exit_code" -eq 0 ]; then
+            # 正常退出通常代表用户主动退出，不再自动重启。
+            echo "[$(date)] 程序正常退出，停止自动重启" >> "$LOG_FILE"
+            break
+        fi
+
+        if [ "$exit_code" -eq 2 ]; then
+            # 单实例锁被占：另有实例在跑，重启也只会撞锁，不计为崩溃。
+            echo "[$(date)] 已有实例在运行（单实例锁被占用），本次启动退出" >> "$LOG_FILE"
+            break
+        fi
+
+        rotate_log "$CRASH_LOG"
+        {
+            echo "===================================="
+            echo "[$(date)] 程序崩溃"
+            echo "退出码: $exit_code"
+            echo "运行时长: ${ran_seconds}秒"
+            echo "===================================="
+            echo ""
+        } >> "$CRASH_LOG"
+
+        if [ "$ran_seconds" -ge "$STABLE_RUN_SECONDS" ]; then
+            # 跑够时长才崩溃算正常波动，退避与计数归零
+            rapid_crashes=0
+            backoff_index=0
+        else
+            rapid_crashes=$((rapid_crashes + 1))
+        fi
+
+        if [ "$rapid_crashes" -ge "$MAX_RAPID_CRASHES" ]; then
+            {
+                echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                echo "[$(date)] 短时间内连续崩溃 ${rapid_crashes} 次，已停止自动重启。"
+                echo "请人工排查：./stock crash  或  ./stock debug"
+                echo "修复后执行 ./stock start"
+                echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+                echo ""
+            } >> "$CRASH_LOG"
+            echo "[$(date)] 短时间内连续崩溃 ${rapid_crashes} 次，已停止自动重启" >> "$LOG_FILE"
+            break
+        fi
+
+        delay=${backoff_table[$backoff_index]}
+        if [ "$backoff_index" -lt $(( ${#backoff_table[@]} - 1 )) ]; then
+            backoff_index=$((backoff_index + 1))
+        fi
+        echo "[$(date)] 程序崩溃(退出码:$exit_code，运行${ran_seconds}秒)，${delay}秒后重启..." >> "$LOG_FILE"
+        sleep "$delay"
+    done
+}
+
+start_monitor() {
+    local existing sup launched
+
+    existing="$(find_all_pids)"
+    if [ -n "$existing" ]; then
+        sup="$(supervisor_pid)"
+        if [ -n "$sup" ]; then
+            # 进程活着但 PID 记录丢了：补写记录，让 status / restart 重新可用
+            echo "$sup" > "$PID_FILE"
+            echo "⚠️  已经在运行中 (supervisor PID: $sup)"
+            echo "   （PID 记录已补写，./stock status / restart 可正常工作）"
+        else
+            echo "⚠️  发现遗留进程但没有 supervisor: $(echo $existing | tr '\n' ' ')"
+            echo "   它们占着单实例锁，新实例起不来。"
+            echo "   请执行 ./stock restart 强制重启"
+        fi
+        return 1
+    fi
+
+    rm -f "$PID_FILE"
+    nohup "$SCRIPT_DIR/stock" _supervise > /dev/null 2>&1 &
+    launched=$!
+    # PID 记录由 supervisor 自己登记；这里兜底，防止它启动即失败时记录为空
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -f "$PID_FILE" ] && break
+        sleep 0.2
+    done
+    [ -f "$PID_FILE" ] || echo "$launched" > "$PID_FILE"
+
+    sleep 0.5
+    if [ -n "$(find_all_pids)" ]; then
+        echo "✅ 已启动（单实例、异常自动重启）"
+    else
+        rm -f "$PID_FILE"
+        echo "⚠️  启动失败：进程没有起来，请查看 ./stock crash 或 ./stock log"
+        return 1
+    fi
+}
+
+stop_monitor() {
+    local pids pid sup waited
+
+    pids="$(find_all_pids)"
+    if [ -z "$pids" ]; then
+        rm -f "$PID_FILE"
+        echo "ℹ️  未运行"
+        return 0
+    fi
+
+    echo "🔎 发现进程: $(echo $pids | tr '\n' ' ')"
+
+    # 先 TERM supervisor：它的 trap 会顺带 TERM 子进程 python
+    sup="$(supervisor_pid)"
+    [ -n "$sup" ] && kill -TERM "$sup" 2>/dev/null
+    # 再 TERM 其余残留（孤儿 python 等）
+    for pid in $pids; do
+        [ -n "$sup" ] && [ "$pid" = "$sup" ] && continue
+        kill -TERM "$pid" 2>/dev/null
+    done
+
+    for waited in 1 2 3 4 5 6 7 8 9 10; do
+        [ -z "$(find_all_pids)" ] && break
+        sleep 1
+    done
+
+    pids="$(find_all_pids)"
+    if [ -n "$pids" ]; then
+        echo "⏳ 未退出，强制结束: $(echo $pids | tr '\n' ' ')"
+        for pid in $pids; do
+            kill -KILL "$pid" 2>/dev/null
+        done
+        sleep 1
+    fi
+
+    rm -f "$PID_FILE"
+    if [ -z "$(find_all_pids)" ]; then
+        echo "✅ 已停止"
+    else
+        echo "❌ 仍有进程存活: $(find_all_pids | tr '\n' ' ')"
+        return 1
+    fi
+}
+
+status_monitor() {
+    local pids sup
+
+    pids="$(find_all_pids)"
+    if [ -z "$pids" ]; then
+        if [ -f "$PID_FILE" ]; then
+            echo "❌ 未运行（PID 记录已过期，已清理）"
+            rm -f "$PID_FILE"
+        else
+            echo "❌ 未运行"
+        fi
+        return 1
+    fi
+
+    sup="$(supervisor_pid)"
+    if [ -n "$sup" ]; then
+        # PID 记录丢失时顺手补写，避免下次 stop/restart 又找不到进程
+        if [ ! -f "$PID_FILE" ] || [ "$(tr -d '[:space:]' < "$PID_FILE")" != "$sup" ]; then
+            echo "$sup" > "$PID_FILE"
+        fi
+        echo "✅ 运行中 (supervisor PID: $sup)"
+    else
+        echo "⚠️  孤儿进程在运行（无 supervisor，崩溃后不会自动重启）"
+    fi
+    echo ""
+    ps -p "$(echo $pids | tr ' ' ',')" -o pid=,ppid=,etime=,rss=,command= 2>/dev/null
+}
+
+case "$1" in
+    _supervise)
+        supervise
+        ;;
+    start)
+        start_monitor
+        ;;
+    stop)
+        stop_monitor
+        ;;
+    restart)
+        echo "— 重启监控 —"
+        stop_monitor
+        sleep 2
+        start_monitor
+        ;;
+    status)
+        status_monitor
+        ;;
+    log)
+        if [ -f "$LOG_FILE" ]; then
+            tail -20 "$LOG_FILE"
+        else
+            echo "暂无日志"
+        fi
+        ;;
+    crash)
+        if [ -f "$CRASH_LOG" ]; then
+            echo "=========================================="
+            echo "📋 崩溃日志"
+            echo "=========================================="
+            tail -50 "$CRASH_LOG"
+        else
+            echo "暂无崩溃记录 ✅"
+        fi
+        ;;
+    debug)
+        DEBUG_LOG="$SCRIPT_DIR/debug.log"
+        if [ -f "$DEBUG_LOG" ]; then
+            echo "=========================================="
+            echo "📋 调试日志"
+            echo "=========================================="
+            tail -30 "$DEBUG_LOG"
+        else
+            echo "暂无调试日志"
+        fi
+        ;;
+    clear)
+        : > "$LOG_FILE"
+        : > "$CRASH_LOG"
+        : > "$SCRIPT_DIR/debug.log"
+        echo "✅ 日志已清空"
+        ;;
+    *)
+        echo "股票监控命令"
+        echo ""
+        echo "用法: stock [命令]"
+        echo ""
+        echo "命令:"
+        echo "  start    启动监控（单实例、异常自动重启）"
+        echo "  stop     停止监控"
+        echo "  restart  重启监控"
+        echo "  status   查看状态"
+        echo "  log      查看日志"
+        echo "  crash    查看崩溃日志"
+        echo "  debug    查看调试日志"
+        ;;
+esac

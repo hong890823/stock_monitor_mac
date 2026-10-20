@@ -1,0 +1,5 @@
+{
+  "api_key": "sk-在此填入你的 API Key",
+  "model": "deepseek-flash",
+  "base_url": "https://api.deepseek.com"
+}
