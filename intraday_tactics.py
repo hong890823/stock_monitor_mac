@@ -867,6 +867,9 @@ class IntradayTactics:
         recent_trend=None,
         trend_weak: bool = False,
         price_location: str | None = None,
+        trade_permissions=None,
+        trend=None,
+        high_position=None,
     ) -> IntradaySignal | None:
         """评估信号并做跃迁 / 两轮确认 / 冷却 / 每日上限过滤。
 
@@ -882,6 +885,7 @@ class IntradayTactics:
             confirmation_rounds: 需要的确认轮数（None使用默认值2）
             ma20 / ma20_prev / closes_below_ma20: M20 上下文，缺省时退回旧口径
             cost / atr_pct / 资金字段 / fundamental_health: 深套决策框架的上下文
+            trade_permissions / trend / high_position: 原样转发给 evaluate 的趋势策略上下文
         """
         state = self._ensure_state(code)
         now = time.time()
@@ -917,6 +921,9 @@ class IntradayTactics:
             recent_trend=recent_trend,
             trend_weak=trend_weak,
             price_location=price_location,
+            trade_permissions=trade_permissions,
+            trend=trend,
+            high_position=high_position,
         )
         if quantity <= 0 and signal is not None and signal.signal_type != IntradaySignalType.PULLBACK:
             signal = None

@@ -34,7 +34,9 @@ class ObservationAlertIntegrationTests(unittest.TestCase):
         self.app._dispatch_to_main = lambda callback: callback()
         self.notifications = []
         self.banners = []
-        self.app.alert_popup = SimpleNamespace(show=lambda *args, **kwargs: self.banners.append(args))
+        # 屏幕打断统一走告警对话框（旧置顶横幅 alert_popup 已废弃）
+        self.app._show_alert_dialog = lambda *args, **kwargs: self.banners.append(args)
+        self.app._popup_should_show = lambda *args, **kwargs: True
 
     def run_round(self, minute, sent=True, stock_price=None):
         now = self.now + timedelta(minutes=minute)
@@ -121,7 +123,8 @@ class ObservationAlertIntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.notifications), 1)
 
     def test_buy_alert_does_not_replace_an_existing_risk_banner(self):
-        self.app.alert_popup.visible = True
+        # 刚弹过风险对话框（冷却窗口内）：观察提醒不打断
+        self.app._popup_should_show = lambda *args, **kwargs: False
         for minute in (0, 1, 2):
             self.run_round(minute)
         self.assertEqual(len(self.notifications), 1)

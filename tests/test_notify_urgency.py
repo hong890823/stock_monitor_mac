@@ -151,17 +151,34 @@ def test_timeout_not_reported_as_success():
 
 
 def test_raise_urgency_has_backup_channels():
-    """crash 级必须有通知系统之外的打断手段。"""
+    """danger/crash 级必须有通知系统之外的打断手段。"""
     import inspect
     src = inspect.getsource(StockMenuBar._raise_urgency)
     assert 'afplay' in src, "缺少独立音效"
     assert '_request_dock_attention' in src, "缺少 Dock 弹跳"
-    assert 'NSAlert' in src, "缺少模态对话框"
-    assert '_run_on_main_once' in src, "模态框没切回主线程（会触发退出码133）"
-    assert 'alert_popup' in src or 'popup.show' in src, "缺少置顶横幅"
+    assert '_show_alert_dialog' in src, "缺少告警对话框"
+    assert 'alert_popup' not in src and 'popup.show' not in src, (
+        "置顶横幅卡片已废弃，不应再出现在打断链路"
+    )
+    dialog_src = inspect.getsource(StockMenuBar._show_alert_dialog)
+    assert 'NSAlert' in dialog_src, "缺少模态对话框"
+    assert '_run_on_main_once' in dialog_src, "对话框没切回主线程（会触发退出码133）"
+    assert '知道了，我去处理' in dialog_src, "缺统一按钮文案"
     attention_src = inspect.getsource(StockMenuBar._request_dock_attention)
     assert 'requestUserAttention_' in attention_src, "Dock 弹跳未调用系统接口"
-    print("  ✓ crash 级有置顶横幅 + 音效 + Dock 弹跳 + 主线程模态框")
+    print("  ✓ danger/crash 有告警对话框 + 音效 + Dock 弹跳（置顶横幅已废弃）")
+    return True
+
+
+def test_dialog_carries_level_label():
+    """级别必须写进对话框（【危险提醒】【系统性风险】等）。"""
+    import inspect
+    labels = StockMenuBar._LEVEL_LABELS
+    for level in ('crash', 'danger', 'warning', 'info'):
+        assert labels.get(level), f"缺少 {level} 级对话框标签"
+    dialog_src = inspect.getsource(StockMenuBar._show_alert_dialog)
+    assert '【{label}】' in dialog_src, "对话框标题未带级别前缀"
+    print("  ✓ 对话框标题标注级别")
     return True
 
 
@@ -189,6 +206,7 @@ if __name__ == '__main__':
         test_normal_uses_active,
         test_timeout_not_reported_as_success,
         test_raise_urgency_has_backup_channels,
+        test_dialog_carries_level_label,
         test_notify_passes_level,
         test_daily_reset_is_called,
     ]

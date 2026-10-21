@@ -334,25 +334,6 @@ if _HAS_OBJC:
             if self._color_fn and row < len(self._items):
                 self._color_fn(cell, self._items[row])
 
-    class _AlertButtonTarget(NSObject):
-        """置顶横幅按钮的 target/action 代理。
-
-        NSButton 的 setTarget_ 必须是 NSObject 子类：纯 Python 对象
-        分发不到 ObjC selector，按钮会点了没反应（不报错）。
-        """
-
-        def init(self):
-            self = objc.super(_AlertButtonTarget, self).init()
-            if self is None:
-                return None
-            self._callback = None
-            return self
-
-        def onPress_(self, _sender):
-            if self._callback:
-                self._callback()
-
-
 # 板块等权代理指数每板块取几只成分股。8 只足够反映板块方向，
 # 再多就把「每天重建一次」的成本抬到分钟级。
 PROXY_CONS_CAP = 8
@@ -768,177 +749,6 @@ class FloatingWindow:
             self._window = None
 
 
-class AlertPopup:
-    """置顶告警横幅窗口（不依赖 macOS 通知系统）。
-
-    为什么需要它：com.apple.python3 这个身份的 timeSensitiveSetting=0，
-    TimeSensitive 中断等级会被系统降级回 Active；而 Active 级在专注模式下
-    只进通知列表、不弹横幅。2026-10-08 大盘跌 3.7% 时因此全程零横幅。
-
-    这里直接用高于普通浮动窗口的层级强制置顶，必定可见，与通知授权、
-    专注模式、代码签名全都无关。盘中暴跌时必须被打断，这个保证是刚需。
-    """
-
-    WIDTH = 460
-    PAD = 18
-    # name -> ((背景 RGBA), (强调色 RGB))
-    COLORS = {
-        'crash':   ((0.42, 0.06, 0.08, 0.96), (0.93, 0.26, 0.21)),
-        'danger':  ((0.40, 0.16, 0.05, 0.96), (0.98, 0.55, 0.14)),
-        'warning': ((0.36, 0.28, 0.05, 0.96), (0.98, 0.80, 0.20)),
-    }
-
-    def __init__(self):
-        self._window = None
-        self._visible = False
-        # 窗口懒创建：__init__ 阶段 NSApplication 可能尚未就绪，
-        # 那时建 NSWindow 会得到不可见的窗。首次 show 时再建。
-
-    def frame(self):
-        """当前窗口位置尺寸，用于日志诊断（窗在哪、有多大）。"""
-        if self._window is None:
-            return None
-        try:
-            f = self._window.frame()
-            return f"({f.origin.x:.0f},{f.origin.y:.0f} {f.size.width:.0f}x{f.size.height:.0f})"
-        except Exception:
-            return "<frame 读取失败>"
-
-    def _create_window(self):
-        # 固定用主显示器（screens[0]，带菜单栏那块）。
-        # NSScreen.mainScreen() 返回的是"当前有焦点窗口的屏幕"，
-        # 多显示器下可能跑到副屏，用户盯着主屏就等于没弹。
-        try:
-            screen = NSScreen.screens()[0]
-        except Exception:
-            screen = NSScreen.mainScreen()
-        frame = screen.visibleFrame()
-        w = self.WIDTH
-        # 四段控件必须自上而下互不相交。曾经 h=168 时正文 frame(y=52..118)
-        # 把副标题(y=88..110)整条框在里面，且正文后 addSubview 画在上层，
-        # 3 行正文的头两行会直接压住副标题文字。
-        h = 200
-        x = frame.origin.x + (frame.size.width - w) / 2
-        # 稍微偏上，避开底部 Dock；又不能太高贴住菜单栏
-        y = frame.origin.y + frame.size.height * 0.58
-
-        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(x, y, w, h),
-            NSBorderlessWindowMask,
-            NSBackingStoreBuffered,
-            False,
-        )
-        # NSScreenSaverWindowLevel 高于浮动窗口，能压在全屏应用之上
-        self._window.setLevel_(NSScreenSaverWindowLevel)
-        # 穿透全屏应用、出现在所有桌面空间，否则用户全屏看盘时看不到
-        try:
-            self._window.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces
-                | NSWindowCollectionBehaviorFullScreenAuxiliary
-            )
-        except Exception:
-            try:
-                self._window.setCollectionBehavior_(
-                    1 << 0 | 1 << 8  # CanJoinAllSpaces | FullScreenAuxiliary
-                )
-            except Exception:
-                pass
-        self._window.setOpaque_(False)
-        self._window.setBackgroundColor_(NSColor.clearColor())
-        self._window.setHasShadow_(True)
-        self._window.setMovableByWindowBackground_(True)
-        self._window.setIgnoresMouseEvents_(False)
-        self._window.setReleasedWhenClosed_(False)
-
-        content = self._window.contentView()
-        content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(14)
-        content.layer().setMasksToBounds_(True)
-
-        self._title_field = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(self.PAD, h - 52, w - 2 * self.PAD - 92, 30)
-        )
-        self._title_field.setEditable_(False)
-        self._title_field.setBezeled_(False)
-        self._title_field.setDrawsBackground_(False)
-        self._title_field.setFont_(NSFont.boldSystemFontOfSize_(18))
-        content.addSubview_(self._title_field)
-
-        self._subtitle_field = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(self.PAD, h - 80, w - 2 * self.PAD, 22)
-        )
-        self._subtitle_field.setEditable_(False)
-        self._subtitle_field.setBezeled_(False)
-        self._subtitle_field.setDrawsBackground_(False)
-        self._subtitle_field.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(14, 0.5))
-        content.addSubview_(self._subtitle_field)
-
-        self._body_view = NSTextView.alloc().initWithFrame_(
-            NSMakeRect(self.PAD - 4, 52, w - 2 * self.PAD + 8, 64)
-        )
-        self._body_view.setEditable_(False)
-        self._body_view.setSelectable_(False)
-        self._body_view.setDrawsBackground_(False)
-        self._body_view.setFont_(NSFont.systemFontOfSize_(12))
-        self._body_view.setTextContainerInset_((4, 2))
-        content.addSubview_(self._body_view)
-
-        self._dismiss_btn = NSButton.alloc().initWithFrame_(
-            NSMakeRect(w - self.PAD - 84, 14, 84, 30)
-        )
-        self._dismiss_btn.setTitle_("知道了")
-        self._dismiss_btn.setBezelStyle_(NSBezelBorder)
-        # target 必须是 NSObject 子类；纯 Python 的 self 分发不到 selector
-        self._btn_target = _AlertButtonTarget.alloc().init()
-        self._btn_target._callback = self.hide
-        self._dismiss_btn.setTarget_(self._btn_target)
-        self._dismiss_btn.setAction_("onPress:")
-        content.addSubview_(self._dismiss_btn)
-
-        self._content_layer = content.layer()
-
-    def show(self, title, subtitle=None, body=None, level='danger'):
-        """显示告警横幅。必须在主线程调用。"""
-        if not _HAS_OBJC:
-            return
-        if self._window is None:
-            self._create_window()
-        if self._window is None:
-            return
-        bg, accent = self.COLORS.get(level, self.COLORS['danger'])
-
-        self._title_field.setStringValue_(str(title or ''))
-        self._title_field.setTextColor_(NSColor.colorWithRed_green_blue_alpha_(*accent, 1.0))
-        self._subtitle_field.setStringValue_(str(subtitle or ''))
-        self._subtitle_field.setTextColor_(NSColor.colorWithWhite_alpha_(0.96, 1.0))
-        self._body_view.setString_(str(body or ''))
-        self._body_view.setTextColor_(NSColor.colorWithWhite_alpha_(0.90, 1.0))
-
-        try:
-            self._content_layer.setBackgroundColor_(
-                NSColor.colorWithRed_green_blue_alpha_(*bg).CGColor()
-            )
-            self._content_layer.setBorderWidth_(2.0)
-            self._content_layer.setBorderColor_(
-                NSColor.colorWithRed_green_blue_alpha_(*accent, 0.9).CGColor()
-            )
-        except Exception:
-            pass
-
-        self._window.makeKeyAndOrderFront_(None)
-        self._window.orderFrontRegardless()
-        self._visible = True
-
-    def hide(self):
-        if _HAS_OBJC and self._window is not None:
-            self._window.orderOut_(None)
-        self._visible = False
-
-    @property
-    def visible(self):
-        return self._visible
-
-
 class StockMenuBar(rumps.App):
     _SUMMARY_TIMEOUT = 90  # 盘面总结总超时（秒）
 
@@ -1210,9 +1020,6 @@ class StockMenuBar(rumps.App):
             on_mode_change=self._on_floating_mode_change,
         )
         self.floating_window.show()
-
-        # 置顶告警横幅（不依赖通知系统，专注模式下依然可见）
-        self.alert_popup = AlertPopup()
 
         self.indicator_menu = rumps.MenuItem("📈 指标策略", callback=None)
         self.indicator_menu.add(rumps.MenuItem("⏳ 加载指标策略…", callback=None))
@@ -4756,9 +4563,18 @@ class StockMenuBar(rumps.App):
             self._entry_review_error = str(error)
 
     def _show_observation_entry_popup(self, alert):
-        popup = getattr(self, "alert_popup", None)
-        if popup is not None and not getattr(popup, "visible", False):
-            popup.show(alert["title"], alert["subtitle"], alert.get("popup_body", alert["body"]), level="info")
+        """观察池买点提醒的屏幕打断：统一走告警对话框（旧置顶横幅已废弃）。
+
+        受同一套 180s 冷却/级别抬升节流：刚弹过风险对话框时不打断
+        （即旧「不覆盖已有风险横幅」的语义）。
+        """
+        if not self._popup_should_show('info'):
+            self.log("观察提醒对话框冷却中，本轮跳过", "INFO")
+            return
+        self._show_alert_dialog(
+            alert["title"], alert["subtitle"],
+            alert.get("popup_body", alert["body"]), "info",
+        )
 
     def review_observation_pool_now(self, _):
         if self._observation_refresh_lock.locked():
@@ -7133,11 +6949,11 @@ class StockMenuBar(rumps.App):
         危险级别还会额外：
         - 用 TimeSensitive 中断等级，穿透专注模式（否则只进通知列表不弹横幅）
         - 播放独立醒目音效
-        crash 级还会弹模态对话框，完全不依赖通知系统。
+        - 弹「知道了，我去处理」告警对话框（框内标注级别），完全不依赖通知系统。
 
-        popup_body：屏幕打断层（置顶横幅 / crash 模态框）的正文，缺省复用
+        popup_body：屏幕打断层（告警对话框）的正文，缺省复用
         body。真预警时两边本就该显示同一份告警内容；只有自测这类"验通道
-        本身"的文案才需要分流，否则通知和横幅各弹一份同样的字，用户看不出
+        本身"的文案才需要分流，否则通知和对话框各弹一份同样的字，用户看不出
         自己在验哪一层。body 归系统通知，popup_body 归屏幕打断。
         """
         title = str(title)[:120]
@@ -7210,15 +7026,22 @@ class StockMenuBar(rumps.App):
             self.log(f"通知发送失败（三个通道均不可用）: {error}", "ERROR")
             return False
 
-    # 置顶横幅冷却（秒）与级别升序。级别抬升时立即弹，同级或降级则节流。
+    # 告警对话框冷却（秒）与级别升序。级别抬升时立即弹，同级或降级则节流。
     _POPUP_COOLDOWN = 180
     _LEVEL_ORDER = {'info': 0, 'warning': 1, 'danger': 2, 'crash': 3}
+    # 对话框标题前缀：级别直接写在框里（2026-10-22 用户要求）。
+    _LEVEL_LABELS = {
+        'crash': '系统性风险',
+        'danger': '危险提醒',
+        'warning': '风险提醒',
+        'info': '观察提醒',
+    }
 
     def _popup_should_show(self, level_name, force=False):
-        """决定这一轮要不要弹置顶横幅。
+        """决定这一轮要不要弹告警对话框。
 
         强制弹出的情形：手动测试；或级别比上次弹的更严重（必须让人知道恶化）。
-        其余情形按冷却时间节流，避免三个指数轮流触发导致每 15 秒弹一次。
+        其余情形按冷却时间节流，避免三个指数轮流触发导致每 15 秒弹一次模态框。
         """
         if force:
             self._popup_last_time = time.time()
@@ -7272,34 +7095,50 @@ class StockMenuBar(rumps.App):
         except Exception as error:
             self.log(f"{tag} 调度失败: {error}", "ERROR")
 
+    def _show_alert_dialog(self, title, subtitle, body, level_name):
+        """统一的告警对话框（NSAlert 模态，按钮「知道了，我去处理」）。
+
+        2026-10-22 起取代置顶横幅卡片：danger/crash 与观察类打断都走它，
+        级别写进标题前缀（【危险提醒】【系统性风险】等）。
+        必须在主线程弹（后台线程建的 NSAlert 不响应点击 / 会触发线程断言）。
+        """
+        label = self._LEVEL_LABELS.get(level_name, str(level_name))
+        informative = f"{subtitle}\n\n{body}" if subtitle else str(body or "")
+
+        def _modal():
+            import AppKit
+            alert = AppKit.NSAlert.alloc().init()
+            alert.setMessageText_(f"【{label}】{title}")
+            alert.setInformativeText_(informative)
+            if level_name == 'crash':
+                alert.setAlertStyle_(AppKit.NSAlertStyleCritical)
+            elif level_name == 'info':
+                alert.setAlertStyle_(AppKit.NSAlertStyleInformational)
+            else:
+                alert.setAlertStyle_(AppKit.NSAlertStyleWarning)
+            alert.addButtonWithTitle_('知道了，我去处理')
+            self.log(f"告警对话框已弹出 level={level_name}，等待用户确认", "INFO")
+            alert.runModal()
+
+        self._run_on_main_once(_modal, tag=f"告警对话框[{level_name}]")
+
     def _raise_urgency(self, title, subtitle, body, popup_body, level_name,
                        force_popup=False):
         """危险级别的额外打断手段，不再只依赖通知系统。
 
         com.apple.python3 的 timeSensitiveSetting=0，TimeSensitive 会被降级，
         专注模式下通知只进列表不弹横幅。所以这里叠三层，第一层是主通道：
-        1. 置顶告警横幅（NSScreenSaverWindowLevel，与通知授权/专注模式无关）
+        1. 告警对话框（NSAlert「知道了，我去处理」，框内标注级别；
+           2026-10-22 起取代置顶横幅卡片，danger/crash 统一用它）
         2. 独立醒目音效 + Dock 图标弹跳
-        3. crash 级再弹模态对话框（NSAlert），必须手动点掉
+        对话框受 180s 冷却 / 级别抬升规则节流——盘中连环触发时不能
+        每 15 秒弹一次模态框，根本没法用。
         """
-        # 1) 置顶横幅——必须在主线程操作 AppKit
-        #    三个指数各自触发后会被合并成一条，但级别抬升会让每轮都像 CRASH。
-        #    没有冷却的话盘中暴跌时每 15 秒弹一次模态框，根本没法用。
-        if not self._popup_should_show(level_name, force=force_popup):
-            self.log(f"置顶横幅冷却中，本轮跳过 level={level_name}", "INFO")
+        # 1) 告警对话框（主线程、节流判定在 _popup_should_show）
+        if self._popup_should_show(level_name, force=force_popup):
+            self._show_alert_dialog(title, subtitle, popup_body, level_name)
         else:
-            def _show_popup():
-                popup = getattr(self, 'alert_popup', None)
-                if popup is None:
-                    self.log("alert_popup 未初始化", "ERROR")
-                    return
-                popup.show(title, subtitle, popup_body, level=level_name)
-                self.log(
-                    f"置顶横幅已显示 level={level_name} "
-                    f"visible={popup.visible} frame={popup.frame()}",
-                    "INFO"
-                )
-            self._run_on_main_once(_show_popup, tag=f"置顶横幅[{level_name}]")
+            self.log(f"告警对话框冷却中，本轮跳过 level={level_name}", "INFO")
 
         # 2) 音效 + Dock 弹跳
         try:
@@ -7318,21 +7157,6 @@ class StockMenuBar(rumps.App):
             self._request_dock_attention(critical=True)
         except Exception:
             pass
-
-        # 3) crash 级模态框（主线程，否则触发 AppKit 线程断言 / 退出码133）
-        if level_name == 'crash':
-            def _modal():
-                import AppKit
-                alert = AppKit.NSAlert.alloc().init()
-                alert.setMessageText_(title)
-                alert.setInformativeText_(
-                    f"{subtitle}\n\n{popup_body}" if subtitle else popup_body
-                )
-                alert.setAlertStyle_(AppKit.NSAlertStyleCritical)
-                alert.addButtonWithTitle_('知道了，我去处理')
-                self.log("CRASH 模态框已弹出，等待用户确认", "INFO")
-                alert.runModal()
-            self._run_on_main_once(_modal, tag="CRASH模态框")
 
     @staticmethod
     def _notify_via_usernotifications(title, subtitle, body, sound, urgent=False):
@@ -7655,6 +7479,8 @@ class StockMenuBar(rumps.App):
     def _check_dip_rebound(self):
         """下探回升（V 型收复）提醒：跌出恐慌坑又被买回来，量能不缩才强提醒。
 
+        个股两级信号：回升刚起步发「反弹观察」（info 级、带诱多/抛压警示），
+        确认门槛达成后升级「深跌回升」；再创新低静默作废观察并重新武装。
         一段下探只提醒一次、创更深新低才重新武装；个股限持仓股（补仓/做T类提示）。
         「资金承接」看回升段成交节奏，不看全天累计——上午恐慌量会把缩量反弹也抬成放量。
         """
@@ -7688,6 +7514,7 @@ class StockMenuBar(rumps.App):
             )
             price = float(data["price"])
             atr_value = (result or {}).get("atr")
+            trend = ((result or {}).get("entry_structure") or {}).get("trend_assessment") or {}
             samples.append(Sample(
                 code=code,
                 name=data.get("name", code),
@@ -7698,6 +7525,8 @@ class StockMenuBar(rumps.App):
                 timestamp=now.timestamp(),
                 atr_pct=(float(atr_value) / price * 100) if atr_value and price > 0 else None,
                 stock=True,
+                major_trend=trend.get("major_trend"),
+                trend_conflict=trend.get("conflict"),
             ))
         for alert in self._dip_rebound_engine.update(samples, now.strftime("%Y-%m-%d")):
             try:
@@ -7705,9 +7534,9 @@ class StockMenuBar(rumps.App):
                     alert.title,
                     "下探回升",
                     alert.body,
-                    level="danger" if alert.vibrate else None,
+                    level="danger" if alert.vibrate else "info",
                 )
-                self.log(f"下探回升提醒: {alert.title}", "INFO")
+                self.log(f"下探回升提醒(阶段{alert.stage}): {alert.title}", "INFO")
             except Exception as error:
                 self.log(f"下探回升提醒发送失败: {error}", "WARNING")
 
