@@ -5,9 +5,11 @@ from decimal import Decimal, ROUND_HALF_UP
 import math
 
 from capital_flow import flow_direction, is_fresh
+from continuation_hold_policy import format_continuation_hold_info
 from entry_structure import compute_entry_input, evaluate
 from intraday_tactics import limit_pct_for_board
 from observation_pool import completed_bars
+from strong_continuation_policy import format_strong_risk
 from volume_ratio import VolumeRatio
 
 
@@ -63,6 +65,10 @@ class ObservationEntryTracker:
             self.reset(code)
             return None
         if (record.get("last_entry_alert", {}).get("date") == date or (date, code) in self._sent):
+            return None
+        permissions = record.get("trade_permissions") or {}
+        if permissions.get("allow_normal_buy") is not True:
+            self.reset(code)
             return None
         try:
             if "ST" in str((quote or {}).get("name") or record["name"]).upper() or "退" in str((quote or {}).get("name") or record["name"]):
@@ -124,13 +130,28 @@ class ObservationEntryTracker:
         if (len(samples) < self.REQUIRED_SAMPLES or span < self.MIN_CONFIRM_SECONDS
                 or flow_span < self.MIN_CONFIRM_SECONDS or live["price"] < samples[0]["price"]):
             return None
+        trend = record.get("trend_assessment") or {}
+        high = record.get("high_position") or {}
+        trend_line = (
+            f"短期趋势：{trend.get('short_trend') or '数据不足'}；"
+            f"大趋势：{trend.get('major_trend') or '数据不足'}；"
+            f"趋势关系：{trend.get('conflict') or '数据不足'}"
+        )
+        high_line = f"高位结构：{high.get('state') or '数据不足'}"
+        hold_line = format_continuation_hold_info(record.get("continuation_hold") or {})
         body = (
+            f"{trend_line}\n{high_line}\n"
+            + (f"{hold_line}\n" if hold_line else "")
+            +
             f"已观察{record['observation_days']}个完整交易日；回踩上行M20（{entry_input.ma20:.2f}）后站稳，"
             f"连续{len(samples)}次、跨{int(span // 60)}分钟观察未继续走低。\n"
             f"折算量比{volume_ratio:.2f}；平台分钟资金净流入连续为正，最新{flow.net_yi:.3f}亿，出现承接迹象。\n"
             f"失效参考{entry.stop_price:.2f}；跌回M20下方或资金转弱需重新判断，不追离回踩区。"
         )
-        popup_body = (f"回踩M20 {entry_input.ma20:.2f} 后站稳，{len(samples)}次/{int(span // 60)}分钟确认\n"
+        popup_body = (f"{trend_line}\n{high_line}\n"
+                      + (f"{hold_line}\n" if hold_line else "")
+                      +
+                      f"回踩M20 {entry_input.ma20:.2f} 后站稳，{len(samples)}次/{int(span // 60)}分钟确认\n"
                       f"资金连续净流入，最新{flow.net_yi:.3f}亿，出现承接迹象\n"
                       f"失效参考{entry.stop_price:.2f}；跌回M20下方需重新判断")
         return {"code": code, "date": date, "at": now.isoformat(timespec="seconds"),

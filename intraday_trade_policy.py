@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 
@@ -52,15 +53,36 @@ def _next_day_review(eligibility: PositionEligibility, reason: str) -> TradeDeci
     )
 
 
+def _value(source, key, default=None):
+    if isinstance(source, Mapping):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
 def evaluate_trade_action(
     intent: str,
     evidence: TimeframeEvidence,
     eligibility: PositionEligibility,
     invalidation_price: float,
+    permissions=None,
+    trend=None,
+    high_position=None,
 ) -> TradeDecision:
     intent = str(intent or "").lower().strip()
     sellable = max(0, int(eligibility.sellable_quantity))
     invalidation = float(invalidation_price or 0.0)
+    if intent in {"buy", "add", "reentry", "t_buy", "t_sell", "do_t"} and permissions is not None:
+        allowed = {
+            "buy": _value(permissions, "allow_normal_buy", False),
+            "add": _value(permissions, "allow_add", False),
+            "reentry": _value(permissions, "allow_reentry", False),
+            "t_buy": _value(permissions, "allow_reentry", False),
+            "t_sell": _value(permissions, "allow_t", False),
+            "do_t": _value(permissions, "allow_t", False),
+        }.get(intent, False)
+        if not allowed:
+            blockers = "；".join(_value(permissions, "blockers", ()) or ())
+            return _wait((blockers or "趋势或高位结构不允许该动作") + "，仅观察，不执行。")
 
     if intent in {"buy", "add"}:
         if invalidation <= 0:

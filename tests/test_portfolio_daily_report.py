@@ -672,7 +672,77 @@ class FormatterRobustnessTests(unittest.TestCase):
 
 
 class CompactPositionDetailTests(unittest.TestCase):
-    def test_details_use_three_lines_and_drop_repeated_framework(self):
+    def test_position_detail_shows_hold_continuation_strategy(self):
+        res = result()
+        res["continuation_hold"] = {
+            "state": "HOLD_CONTINUATION",
+            "state_label": "持有延续",
+            "keep_observation_position": True,
+        }
+        res["entry_structure"] = {
+            "trend_assessment": {
+                "short_trend": "近期向上",
+                "major_trend": "大趋势向上",
+                "conflict": "长短趋势同步向上",
+            },
+            "high_position": {"state": "非高位"},
+        }
+        text = "\n".join(_format_one_position(res, {"today": -120, "pct": -3.0}))
+        self.assertIn("持有策略：持有延续", text)
+        self.assertIn("保留观察仓", text)
+
+    def test_strong_risk_shows_daily_ready_without_trade_execution(self):
+        res = result()
+        res["entry_structure"] = {
+            "can_enter": True,
+            "strong_continuation": {
+                "state": "M5_BREAK_RISK",
+                "risk_line": "MA5",
+                "risk_price": 11.0,
+                "confirmed": True,
+            },
+            "trend_assessment": {
+                "short_trend": "近期向上",
+                "major_trend": "大趋势向上",
+                "conflict": "长短趋势同步向上",
+            },
+            "high_position": {"state": "非高位"},
+        }
+
+        text = "\n".join(_format_one_position(res, {"today": -120, "pct": -3.0}))
+        self.assertIn("日线就绪（非交易执行）", text)
+        self.assertIn("跌破五日线风险", text)
+        self.assertNotIn("自动卖出", text)
+
+    def test_trend_and_high_position_precede_action(self):
+        res = result()
+        res["entry_structure"] = {
+            "trend_assessment": {
+                "short_trend": "近期向上",
+                "major_trend": "大趋势向上",
+                "conflict": "长短趋势同步向上",
+                "evidence": {
+                    "box_upper": 11.2,
+                    "box_lower": 9.8,
+                    "box_width_pct": 14.3,
+                },
+            },
+            "high_position": {"state": "非高位"},
+            "trade_permissions": {"allow_normal_buy": True},
+        }
+
+        lines = _format_one_position(res, {"today": -120, "pct": -3.0})
+
+        text = "\n".join(lines)
+        self.assertIn("短期趋势：近期向上", text)
+        self.assertIn("大趋势：大趋势向上", text)
+        self.assertIn("箱体上沿 11.20", text)
+        self.assertIn("箱体下沿 9.80", text)
+        self.assertIn("高位结构：非高位", text)
+        self.assertLess(text.index("大趋势"), text.index("动作："))
+        self.assertLess(text.index("高位结构"), text.index("动作："))
+
+    def test_details_use_four_lines_and_drop_repeated_framework(self):
         res = result(
             signal="减仓风险",
             action=(
@@ -689,12 +759,12 @@ class CompactPositionDetailTests(unittest.TestCase):
 
         lines = _format_one_position(res, row)
 
-        self.assertEqual(len(lines), 3)
-        self.assertIn("基本面亮红灯", lines[1])
-        self.assertIn("动作：", lines[2])
-        self.assertIn("风险观察", lines[2])
-        self.assertIn("不作卖出处置", lines[2])
-        self.assertIn("近20日跑输大盘8.0pp", lines[2])
+        self.assertEqual(len(lines), 4)
+        self.assertIn("基本面亮红灯", lines[2])
+        self.assertIn("动作：", lines[3])
+        self.assertIn("风险观察", lines[3])
+        self.assertIn("不作卖出处置", lines[3])
+        self.assertIn("近20日跑输大盘8.0pp", lines[3])
         self.assertNotIn("不加仓、不摊平", "\n".join(lines))
 
 

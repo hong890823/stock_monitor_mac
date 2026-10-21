@@ -110,6 +110,7 @@ class SinglePositionUpdateTests(unittest.TestCase):
 
     def test_updates_only_selected_position_and_refreshes(self):
         app = self._app()
+        today = stock_menubar.datetime.now().date().isoformat()
 
         edit_position = getattr(app, "show_portfolio_position_update", None)
         self.assertIsNotNone(edit_position)
@@ -117,7 +118,7 @@ class SinglePositionUpdateTests(unittest.TestCase):
 
         kwargs = app._window.call_args.kwargs
         self.assertEqual(kwargs["title"], "修改中国卫星")
-        self.assertEqual(kwargs["default_text"], "1100,88.38,2026-10-20")
+        self.assertEqual(kwargs["default_text"], f"1100,88.38,{today}")
         self.assertEqual(app.portfolio["positions"][0]["quantity"], 520)
         self.assertEqual(app.portfolio["positions"][0]["cost"], 20.1)
         self.assertEqual(app.portfolio["positions"][1]["quantity"], 1100)
@@ -157,6 +158,7 @@ class SinglePositionUpdateTests(unittest.TestCase):
 
     def test_default_text_preserves_full_cost_precision(self):
         app = self._app()
+        today = stock_menubar.datetime.now().date().isoformat()
         app.portfolio["positions"][0]["cost"] = 18.1234
         app._window.return_value.run = lambda: SimpleNamespace(clicked=False, text="")
 
@@ -166,11 +168,12 @@ class SinglePositionUpdateTests(unittest.TestCase):
 
         self.assertEqual(
             app._window.call_args.kwargs["default_text"],
-            "1100,18.1234,2026-10-20",
+            f"1100,18.1234,{today}",
         )
 
     def test_default_text_round_trips_float_precision(self):
         app = self._app()
+        today = stock_menubar.datetime.now().date().isoformat()
         exact_cost = 0.12345678901234566
         app.portfolio["positions"][0]["cost"] = exact_cost
         app._window.return_value.run = lambda: SimpleNamespace(clicked=False, text="")
@@ -181,7 +184,7 @@ class SinglePositionUpdateTests(unittest.TestCase):
 
         self.assertEqual(
             app._window.call_args.kwargs["default_text"],
-            f"1100,{exact_cost!r},2026-10-20",
+            f"1100,{exact_cost!r},{today}",
         )
 
     def test_save_failure_rolls_back_selected_position(self):

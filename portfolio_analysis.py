@@ -11,6 +11,7 @@ from deep_loss_policy import (
     suggested_add_quantity,
 )
 from entry_structure import EntryInput, evaluate as evaluate_entry
+from continuation_hold_policy import format_continuation_hold_info
 from fundamental_health import tendency as health_tendency
 from intraday_tactics import IntradayTactics, limit_pct_for_board
 from intraday_trade_policy import PositionEligibility
@@ -163,8 +164,14 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
 
     # ── 入场结构（三态）：复用技术分析已算好的结果，避免两套口径 ──
     entry_info = technical.get("entry_structure") or {}
+    continuation_hold = (
+        technical.get("continuation_hold")
+        or entry_info.get("continuation_hold")
+        or {}
+    )
+    trade_permissions = entry_info.get("trade_permissions") or {}
     entry_state = entry_info.get("state", "NO_STRUCTURE")
-    entry_can_buy = bool(entry_info.get("can_buy"))
+    entry_can_buy = bool(entry_info.get("can_buy")) and bool(trade_permissions.get("allow_normal_buy", True))
     trend_weak = bool(entry_info.get("trend_weak"))
     bias_pct = float(entry_info.get("bias_pct", 0.0) or 0.0)
     prior_high = float(entry_info.get("prior_high", resistance) or resistance)
@@ -215,6 +222,17 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
                 "股价处20日高位且非深套，趋势已走坏，建议准备清仓；"
                 f"确认跌破支撑 {support:.2f} 后清仓离场，执行可分批，不等反抽确认。"
             )
+        elif continuation_hold.get("state") in {"BREAK_DEFENSE", "DISTRIBUTION_RISK"}:
+            signal = "减仓风险"
+            action = format_continuation_hold_info(continuation_hold)
+        elif continuation_hold.get("state") == "PROFIT_PROTECTION":
+            signal = "持有/止盈观察"
+            action = format_continuation_hold_info(continuation_hold)
+        elif continuation_hold.get("state") in {
+            "HOLD_CONTINUATION", "SECOND_WAVE_WATCH", "SECOND_WAVE_CONFIRMED",
+        }:
+            signal = "持有观察"
+            action = format_continuation_hold_info(continuation_hold)
         elif trend_weak:
             signal = "趋势转弱观察"
             action = (
@@ -338,11 +356,14 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
         "entry_stop_price": stop_price,
         "entry_invalid_rule": invalid_rule,
         "entry_can_buy": entry_can_buy,
+        "trade_permissions": trade_permissions,
         "trend_weak": trend_weak,
         "ma20": entry_info.get("ma20", technical.get("ma20")),
         "ma20_prev": entry_info.get("ma20_prev"),
         "closes_below_ma20": entry_info.get("closes_below_ma20", 0),
         "entry_structure": entry_info,  # 原始字典，供盘中信号检测取 M20 上下文
+        "continuation_hold": continuation_hold,
+        "continuation_state": continuation_hold.get("state"),
         "recent_trend": recent_trend,
         "analyzed_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
     }

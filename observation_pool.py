@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 from datetime import datetime
+from continuation_hold_policy import (
+    ContinuationHoldInput,
+    assess_continuation_hold,
+    continuation_hold_to_dict,
+    format_continuation_hold_info,
+)
 import json
 import math
 import os
@@ -12,7 +18,20 @@ import re
 import tempfile
 
 from entry_structure import Ma20Slope, VolumeState, compute_entry_input, evaluate
+from high_position_policy import HighPositionInput, assess_high_position, high_position_to_dict
 from observation_ui import build_observation_view, decorate_stock
+from strong_continuation_policy import (
+    StrongContinuationInput,
+    assess_strong_continuation,
+    strong_continuation_to_dict,
+)
+from trend_assessment import (
+    assess_trend,
+    build_trade_permissions,
+    trend_assessment_to_dict,
+)
+
+import pandas as pd
 
 
 def completed_bars(rows, at):
@@ -37,7 +56,10 @@ class ObservationPool:
     MIN_OBSERVATION_DAYS = 2
     MAX_OBSERVATION_DAYS = 5
     REENTRY_COOLDOWN_DAYS = 5
-    SOURCE_LABELS = {"strict": "严格", "relaxed": "宽松", "five_confirmed": "513确认", "five_waiting": "513观察"}
+    SOURCE_LABELS = {
+        "strict": "严格", "relaxed": "宽松", "five_confirmed": "513确认",
+        "five_waiting": "513观察", "strong": "强势延续",
+    }
     ACTIVE_STATUSES = {"observing", "ready"}
 
     def __init__(self, state_path=None):
@@ -87,7 +109,7 @@ class ObservationPool:
                 "price": None, "score": 0, "stop_price": None, "history": []}
 
     @staticmethod
-    def _assess(bars, benchmark):
+    def _assess(bars, benchmark, strong_candidate=False):
         date = bars[-1]["date"]
         market = [bar for bar in benchmark if bar["date"] <= date]
         benchmark_ok = None
@@ -101,36 +123,201 @@ class ObservationPool:
         if entry_input is None:
             raise ValueError("日线不足25根")
         entry = evaluate(entry_input)
-        can_enter = entry.can_buy and benchmark_ok is True
+        trend_result = assess_trend(
+            pd.DataFrame(bars),
+            price=bars[-1]["close"],
+            benchmark_ok=benchmark_ok,
+        )
+        sample = bars[-60:]
+        low60 = min(bar["low"] for bar in sample)
+        high60 = max(bar["high"] for bar in sample)
+        if high60 > low60:
+            location_ratio = (bars[-1]["close"] - low60) / (high60 - low60)
+            price_location = (
+                "HIGH" if location_ratio >= 0.85
+                else "LOW" if location_ratio <= 0.15
+                else "MID"
+            )
+            range_width_pct = (high60 - low60) / low60 * 100
+        else:
+            price_location = "MID"
+            range_width_pct = 0.0
+        average_volume20 = sum(bar["volume"] for bar in bars[-20:]) / min(20, len(bars))
+        volume_ratio = (
+            bars[-1]["volume"] / average_volume20 if average_volume20 > 0 else None
+        )
+        true_ranges = [
+            max(
+                bar["high"] - bar["low"],
+                abs(bar["high"] - bars[index - 1]["close"]),
+                abs(bar["low"] - bars[index - 1]["close"]),
+            )
+            for index, bar in enumerate(bars[-14:], start=max(1, len(bars) - 14))
+        ]
+        high_result = assess_high_position(HighPositionInput(
+            price=bars[-1]["close"],
+            price_location=price_location,
+            range_width_pct=range_width_pct,
+            atr=sum(true_ranges) / len(true_ranges) if true_ranges else None,
+            volume_ratio=volume_ratio,
+            close=bars[-1]["close"],
+            open=bars[-1]["open"],
+            bar_position=(
+                (bars[-1]["close"] - bars[-1]["low"])
+                / (bars[-1]["high"] - bars[-1]["low"])
+                if bars[-1]["high"] > bars[-1]["low"] else None
+            ),
+            lower_pivots_rising=None,
+            support_holds=None,
+            support=min(bar["low"] for bar in bars[-20:]),
+            resistance=max(bar["high"] for bar in bars[-20:]),
+            short_trend=trend_result.short_trend.value,
+            market_ok=benchmark_ok,
+            sector_ok=None,
+            timeframe=None,
+        ))
+        permissions = build_trade_permissions(
+            trend_result,
+            entry.can_buy,
+            high_result.state,
+            benchmark_ok,
+            None,
+            None,
+            "buy",
+            0.0,
+            0.0,
+        )
+        ma5 = sum(bar["close"] for bar in bars[-5:]) / 5
+        ma10 = sum(bar["close"] for bar in bars[-10:]) / 10
+        ma20 = sum(bar["close"] for bar in bars[-20:]) / 20
+        ma20_prev = sum(bar["close"] for bar in bars[-21:-1]) / 20
+        bias_pct = (bars[-1]["close"] - ma5) / ma5 * 100 if ma5 else 0.0
+        breakout_reference = max(bar["close"] for bar in bars[:-5]) if len(bars) > 5 else None
+        recent_lows = [bar["low"] for bar in bars[-3:]]
+        previous_lows = [bar["low"] for bar in bars[-6:-3]]
+        lower_pivots_rising = (
+            min(recent_lows) >= min(previous_lows) if previous_lows else None
+        )
+        support_holds = bars[-1]["low"] >= min(bar["low"] for bar in bars[-20:])
+        strong_result = assess_strong_continuation(StrongContinuationInput(
+            price=bars[-1]["close"],
+            ma5=ma5,
+            ma10=ma10,
+            ma20=ma20,
+            ma20_prev=ma20_prev,
+            price_location=price_location,
+            bias_pct=bias_pct,
+            breakout_reference=breakout_reference,
+            volume_ratio=volume_ratio,
+            lower_pivots_rising=lower_pivots_rising,
+            support_holds=support_holds,
+            market_ok=benchmark_ok,
+            sector_ok=None,
+        ))
+        strong_info = strong_continuation_to_dict(strong_result)
+        hold_result = assess_continuation_hold(ContinuationHoldInput(
+            strong_state=strong_info["state"],
+            high_state=high_result.state.name,
+            risk_line=strong_info.get("risk_line"),
+            risk_price=strong_result.risk_price,
+            bias_pct=bias_pct,
+            volume_ratio=volume_ratio,
+            first_wave=strong_result.state.name in {
+                "STRONG_CONTINUATION", "EXTENDED_CONTINUATION",
+            },
+            timeframe_ok=None,
+        ))
+        hold_info = continuation_hold_to_dict(hold_result)
+        can_enter = (
+            strong_candidate
+            and entry.can_buy
+            and strong_result.eligible_candidate
+            and high_result.state.value not in {"高位派发风险", "二波候选"}
+        )
         score = sum((entry.ma20_slope == Ma20Slope.UP, entry.volume_state == VolumeState.SHRINK,
                      entry.can_buy, benchmark_ok is True))
-        reason = "；".join(entry.blockers or entry.reasons) or entry.state_label
+        reason = "；".join(filter(None, (
+            f"{trend_result.major_trend.value}：{trend_result.summary}",
+            "；".join(high_result.reasons or high_result.blockers),
+            "；".join(entry.blockers or entry.reasons) or entry.state_label,
+            "；".join(strong_result.reasons or strong_result.blockers),
+            format_continuation_hold_info(hold_info),
+        )))
         if benchmark_ok is None:
             reason = "大盘同日完整日线暂缺，等待复核；" + reason
         return {"date": date, "price": bars[-1]["close"], "score": score,
                 "can_enter": can_enter, "trend_weak": entry.trend_weak,
                 "structure": entry.state_label, "ma20": entry_input.ma20,
                 "volume_ratio": entry_input.volume_ratio, "benchmark_ok": benchmark_ok,
-                "stop_price": entry.stop_price, "invalid_rule": entry.invalid_rule, "reason": reason}
+                "stop_price": entry.stop_price, "invalid_rule": entry.invalid_rule, "reason": reason,
+                "trend_assessment": trend_assessment_to_dict(trend_result),
+                "high_position": high_position_to_dict(high_result),
+                "strong_continuation": strong_info,
+                "continuation_hold": hold_info,
+                "strong_state": strong_info["state"],
+                "risk_line": strong_info.get("risk_line"),
+                "risk_price": strong_result.risk_price,
+                "strong_risk_confirmed": strong_result.risk_confirmed,
+                "trade_permissions": {
+                    "allow_normal_buy": permissions.allow_normal_buy,
+                    "allow_add": permissions.allow_add,
+                    "allow_reentry": permissions.allow_reentry,
+                    "allow_t": permissions.allow_t,
+                    "allow_probe": permissions.allow_probe,
+                    "risk_only": permissions.risk_only,
+                    "blockers": list(permissions.blockers),
+                },
+                "trend_mode": trend_result.conflict.name,
+                "missing_data": list(trend_result.missing_data) + list(high_result.missing_data)}
 
     def _set_status(self, record):
         history = record["history"]
         latest = history[-1]
-        record.update({key: latest[key] for key in ("price", "score", "stop_price", "structure", "invalid_rule")})
+        record.update({key: latest[key] for key in (
+            "price", "score", "stop_price", "structure", "invalid_rule",
+            "can_enter", "benchmark_ok", "trend_assessment", "high_position",
+            "trade_permissions", "trend_mode", "missing_data", "strong_continuation",
+            "strong_state", "risk_line", "risk_price", "strong_risk_confirmed",
+            "continuation_hold",
+        ) if key in latest})
         record["last_reviewed_date"] = latest["date"]
         record["observation_days"] = len(history)
         weak_twice = len(history) >= 2 and all(item["trend_weak"] for item in history[-2:])
-        if weak_twice:
+        strong_state = latest.get("strong_state")
+        dynamic_risk = strong_state in {"M20_BREAK_RISK", "M5_BREAK_RISK"}
+        strong_structural_risk = (
+            strong_state in {"REJECTED_BREAKOUT", "DISTRIBUTION_RISK"}
+            and "strong" in record.get("sources", [])
+        )
+        if dynamic_risk or strong_structural_risk:
+            confirmed = latest.get("strong_risk_confirmed") is True
+            status = "eliminated" if confirmed else "observing"
+            decision = "破位确认" if confirmed else "风险预警"
+            risk_line = latest.get("risk_line") or "动态"
+            risk_price = latest.get("risk_price")
+            risk_price_text = f" {risk_price:.2f}" if risk_price is not None else ""
+            reason = f"{decision}：{strong_state}，参考{risk_line}{risk_price_text}，风险优先于候选晋级"
+            record["can_enter"] = False
+        elif strong_state == "EXTENDED_CONTINUATION":
+            status, reason = "observing", "高位或乖离较大，仅作延伸观察，不进入确定候选"
+            record["can_enter"] = False
+        elif strong_state == "MISSING":
+            status, reason = "observing", "强势延续核心数据不足，不做默认放行，等待复核"
+            record["can_enter"] = False
+        elif weak_twice:
             status, reason = "eliminated", "连续两个完整交易日趋势转弱，淘汰观察"
         elif latest["benchmark_ok"] is None:
             status, reason = "observing", latest["reason"]
         elif len(history) >= self.MIN_OBSERVATION_DAYS and latest["can_enter"]:
-            status, reason = "ready", f"观察{len(history)}个交易日，{latest['structure']}成立，大盘过滤通过"
+            status, reason = "ready", (
+                f"观察{len(history)}个交易日，{latest['structure']}成立，大盘过滤通过；"
+                f"{latest['reason']}"
+            )
         elif len(history) >= self.MAX_OBSERVATION_DAYS:
             status, reason = "expired", f"观察满{self.MAX_OBSERVATION_DAYS}个交易日，当前未形成可介入结构"
         else:
             status = "observing"
-            reason = "首个完整交易日，继续观察；" + latest["structure"] if len(history) == 1 else latest["reason"]
+            reason = "首个完整交易日，继续观察；" + latest["reason"] if len(history) == 1 else latest["reason"]
         record.update(status=status, reason=reason, data_status="已复核")
         if status == "observing" and latest["benchmark_ok"] is None:
             record["data_status"] = "待复核：大盘同日完整日线暂缺"
@@ -188,7 +375,22 @@ class ObservationPool:
                         continue
                     if record["last_reviewed_date"] and bar["date"] < record["last_reviewed_date"]:
                         continue
-                    assessment = self._assess(bars[:index + 1], market)
+                    assessment = self._assess(
+                        bars[:index + 1], market,
+                        strong_candidate="strong" in record.get("sources", []),
+                    )
+                    previous_permissions = record.get("trade_permissions") or {}
+                    if (
+                        previous_permissions.get("allow_normal_buy") is True
+                        and assessment.get("strong_state") == "STRONG_CONTINUATION"
+                        and not assessment.get("trend_weak")
+                        and (assessment.get("high_position") or {}).get("state")
+                        not in {"高位派发风险", "二波候选"}
+                    ):
+                        assessment["trade_permissions"] = dict(
+                            previous_permissions,
+                            allow_normal_buy=True,
+                        )
                     history = record["history"]
                     if history and history[-1]["date"] == bar["date"]:
                         history[-1] = assessment

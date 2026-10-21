@@ -36,6 +36,13 @@ class MarketEnvironmentEvidenceTests(unittest.TestCase):
         self.assertIn('最近3日均值18,000亿', summary)
         self.assertIn('今日预估单独观察', summary)
 
+    def test_environment_quality_and_turnover_activity_are_separate_dimensions(self):
+        result = self.evaluate(predicted_turnover_yi=18500)
+
+        self.assertEqual(result.activity_label, "中性偏弱")
+        self.assertIn("量能活跃度=中性偏弱", result.summary())
+        self.assertEqual(result.status, MarketEnvironmentStatus.NORMAL)
+
     def test_three_days_above_floor_but_low_average_stays_unconfirmed(self):
         result = self.evaluate(recent_full_day_turnovers_yi=[17000, 17000, 17000])
         self.assertEqual(result.persistence_days, 3)

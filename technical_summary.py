@@ -9,10 +9,13 @@
 """
 
 from dataclasses import dataclass
+import math
 from typing import Dict, Optional
 
 from volume_price import VolumePrice, tag as vp_tag
 from price_position import PriceLocation
+from continuation_hold_policy import format_continuation_hold_info
+from strong_continuation_policy import format_strong_risk
 
 
 @dataclass
@@ -28,6 +31,10 @@ class TechnicalSummary:
     action: str        # 操作建议
     entry: str = ""    # 入场结构状态
     divergence: str = ""   # 量价背离结论（OBV 顶/底背离）
+    unified_trend: str = ""
+    high_position: str = ""
+    strong_risk: str = ""
+    hold_strategy: str = ""
 
     @classmethod
     def from_result(
@@ -131,6 +138,40 @@ class TechnicalSummary:
         # ── 入场结构 ──
         entry_info = result.get("entry_structure") or {}
         entry = entry_info.get("state_label", "暂未形成有效入场结构")
+        trend_info = entry_info.get("trend_assessment") or {}
+        trend_evidence = trend_info.get("evidence") or {}
+        high_info = entry_info.get("high_position") or {}
+        strong_info = entry_info.get("strong_continuation") or result.get("strong_continuation") or {}
+        hold_info = entry_info.get("continuation_hold") or result.get("continuation_hold") or {}
+        hold_strategy = ""
+        if hold_info:
+            hold_strategy = (
+                f"{hold_info.get('state_label') or hold_info.get('state') or '数据不足'}｜"
+                f"{format_continuation_hold_info(hold_info)}"
+            )
+        strong_risk = format_strong_risk(strong_info)
+        if entry_info.get("can_enter") or result.get("can_enter"):
+            strong_risk = "；".join(filter(None, (strong_risk, "日线就绪（非交易执行）")))
+        trend_parts = []
+        if trend_info:
+            trend_parts.extend([
+                f"短期{trend_info.get('short_trend', '数据不足')}",
+                f"大趋势{trend_info.get('major_trend', '数据不足')}",
+                str(trend_info.get('conflict') or "趋势尚未形成完整共振"),
+            ])
+        box_upper = _positive_float(trend_evidence.get("box_upper"))
+        box_lower = _positive_float(trend_evidence.get("box_lower"))
+        if box_upper is not None and box_lower is not None and box_upper > box_lower:
+            box_state = str(trend_evidence.get("box_state") or "")
+            if box_state not in {"", "箱体震荡", "非箱体", "箱体数据不足"}:
+                trend_parts.append(f"箱体状态 {box_state}")
+            trend_parts.append(f"箱体上沿 {box_upper:.2f}")
+            trend_parts.append(f"箱体下沿 {box_lower:.2f}")
+            box_width = _positive_float(trend_evidence.get("box_width_pct"))
+            if box_width is not None:
+                trend_parts.append(f"区间 {box_width:.1f}%")
+        unified_trend = "｜".join(trend_parts) if trend_parts else "统一趋势暂缺"
+        high_position = high_info.get("state", "高位结构暂缺")
 
         # ── 量价背离（OBV 顶/底背离）──
         obv_div = result.get("obv_divergence") or {}
@@ -146,6 +187,10 @@ class TechnicalSummary:
             action=action,
             entry=entry,
             divergence=divergence,
+            unified_trend=unified_trend,
+            high_position=high_position,
+            strong_risk=strong_risk,
+            hold_strategy=hold_strategy,
         )
 
 
@@ -162,10 +207,22 @@ def format_summary(summary: TechnicalSummary) -> str:
         f"📊 技术分析摘要\n"
         f"评分：{summary.score}分（{summary.score_label}）\n"
         f"趋势：{summary.trend}\n"
-        f"量价：{summary.volume}\n"
+        f"统一趋势：{summary.unified_trend}\n"
+        f"高位结构：{summary.high_position}\n"
+        + (f"强势风险：{summary.strong_risk}\n" if summary.strong_risk else "")
+        + (f"持有策略：{summary.hold_strategy}\n" if summary.hold_strategy else "")
+        + f"量价：{summary.volume}\n"
         + (f"{summary.divergence}\n" if summary.divergence else "")
         + f"动量：{summary.momentum}\n"
         f"位置：{summary.levels}\n"
         f"入场结构：{summary.entry}\n"
         f"建议：{summary.action}"
     )
+
+
+def _positive_float(value) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and number > 0 else None

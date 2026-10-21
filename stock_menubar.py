@@ -20,6 +20,7 @@ import os
 import sys
 import subprocess
 import json
+import math
 import tempfile
 import fcntl
 import warnings
@@ -30,6 +31,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from indicator_refresh import IndicatorRefreshScheduler
 from indicator_sort import order_relaxed_hits, order_strict_hits
 from limit_up_acceleration import evaluate_limit_up_acceleration
+from continuation_hold_policy import (
+    ContinuationHoldInput,
+    assess_continuation_hold,
+    continuation_hold_to_dict,
+)
 from sector_leaders import (
     HoldingSectorStore,
     LeaderGuard,
@@ -74,7 +80,14 @@ from intraday_trade_policy import (
 from trade_action_guard import guard_actionable_copy, guard_intraday_signal
 from market_evidence import update_t_filter_event_outcome
 from market_timing import format_market_timing_data
+from market_cycle_policy import MarketCycleInput, assess_market_cycle, format_market_cycle_assessment
+from market_cycle_state import MarketCycleStateStore
+from menu_item_utils import replace_menu_item_title
 from stock_analysis import analyze_history, format_report
+from strong_continuation_policy import (
+    StrongContinuationInput,
+    assess_strong_continuation,
+)
 from trade_calculator import (
     calculate_trade,
     format_trade_report,
@@ -1009,6 +1022,9 @@ class StockMenuBar(rumps.App):
         self.turnover_tracker = TurnoverTracker(
             os.path.join(self.log_dir, "_turnover_tracker.json")
         )
+        self.market_cycle_state_store = MarketCycleStateStore(
+            os.path.join(self.log_dir, "_market_cycle_state.json")
+        )
         self._turnover_snapshot = None
         self._prev_curve: Optional[TurnoverCurve] = None
         self._prev_curve_date: str | None = None
@@ -1035,6 +1051,7 @@ class StockMenuBar(rumps.App):
         self.concept_update_count = 59  # 概念板块更新计数器（首次立即获取，之后每60次=15分钟）
         self.indicator_data = []  # 指标选股结果
         self.relaxed_indicator_data = []  # 宽松预警结果
+        self.strong_candidate_data = []  # 强势突破延续观察结果
         self.five_one_three_data = []  # 513低位形态结果
         # 指标两档 / 趋势+513 两组各自的「上次真正刷新」时间（保质期判定用）
         self._indicator_group_at = None
@@ -2258,6 +2275,23 @@ class StockMenuBar(rumps.App):
                 )
             ),
         )
+        cycle_history = (
+            self.turnover_tracker.recent_full_day_turnovers(
+                datetime.now().strftime("%Y-%m-%d"), limit=5
+            )
+            if self.turnover_tracker else ()
+        )
+        cycle_assessment = assess_market_cycle(MarketCycleInput(
+            predicted_turnover_yi=environment.predicted_turnover_yi,
+            turnover_history_yi=cycle_history,
+            index_today_pct=sh.get("change_pct") if sh else None,
+            industry_breadth=(sec_rising / sec_total if sec_total else None),
+            concept_breadth=(con_rising / con_total if con_total else None),
+        ))
+        cycle_text = (
+            f"量能活跃度={cycle_assessment.regime.value}；"
+            + format_market_cycle_assessment(cycle_assessment)
+        )
 
         def _lead_fmt(s):
             name = s.get('lead', '')
@@ -2335,6 +2369,7 @@ class StockMenuBar(rumps.App):
                 f'定性：{qual}。{breadth_text}。量能：{turnover_text}。'
             )
             R.append(f'环境判断：{environment.label}。{environment.summary()}。')
+            R.append(f'行情节奏：{cycle_text}')
         elif sh:
             R.append(f'沪指{sh["change_pct"]:+.2f}%。')
         else:
@@ -2646,14 +2681,17 @@ class StockMenuBar(rumps.App):
     def _tick_summary_timer(self, _):
         """每秒更新计时显示"""
         self._summary_elapsed += 1
-        self._summary_menu_item.title = f"⏳ 正在生成盘面总结... ({self._summary_elapsed}s)"
+        replace_menu_item_title(
+            self._summary_menu_item,
+            f"⏳ 正在生成盘面总结... ({self._summary_elapsed}s)",
+        )
 
     def _start_summary_timer(self):
         """启动计时器"""
         self._summary_elapsed = 0
         self._summary_timer = rumps.Timer(self._tick_summary_timer, 1)
         self._summary_timer.start()
-        self._summary_menu_item.title = "⏳ 正在生成盘面总结... (0s)"
+        replace_menu_item_title(self._summary_menu_item, "⏳ 正在生成盘面总结... (0s)")
 
     def _stop_summary_timer(self):
         """停止计时器"""
@@ -3057,7 +3095,7 @@ class StockMenuBar(rumps.App):
                 if self._summary_timer:
                     self._summary_timer.stop()
                 self._summary_timer = None
-                self._summary_menu_item.title = "📋 盘面总结"
+                replace_menu_item_title(self._summary_menu_item, "📋 盘面总结")
             except Exception:
                 pass
             if show_window and summary:
@@ -3077,7 +3115,7 @@ class StockMenuBar(rumps.App):
     def _on_summary_failed(self, error_message):
         """主线程：盘面总结生成失败，恢复菜单状态并提示原因。"""
         self._stop_summary_timer()
-        self._summary_menu_item.title = "📋 盘面总结"
+        replace_menu_item_title(self._summary_menu_item, "📋 盘面总结")
         self._alert(
             title="盘面总结生成失败",
             message=f"本次总结未完成：{error_message}\n\n请稍后重试。",
@@ -3087,7 +3125,7 @@ class StockMenuBar(rumps.App):
         """主线程：盘面总结被用户取消"""
         timer.stop()
         self._stop_summary_timer()
-        self._summary_menu_item.title = "📋 盘面总结"
+        replace_menu_item_title(self._summary_menu_item, "📋 盘面总结")
         self.log("盘面总结生成已取消", "INFO")
 
     def _on_summary_timeout(self, timer):
@@ -3095,7 +3133,7 @@ class StockMenuBar(rumps.App):
         timer.stop()
         self._stop_summary_timer()
         self._summary_cancel.set()  # 通知后台线程尽快退出
-        self._summary_menu_item.title = "📋 盘面总结"
+        replace_menu_item_title(self._summary_menu_item, "📋 盘面总结")
         self.log("盘面总结生成超时，部分数据源无响应", "WARNING")
         self._alert(
             title="📋 盘面总结",
@@ -3108,14 +3146,17 @@ class StockMenuBar(rumps.App):
                  f"summary_text={'有' if self._summary_text else '无'}", "INFO")
         timer.stop()
         self._stop_summary_timer()
-        self._summary_menu_item.title = "📋 盘面总结"
+        replace_menu_item_title(self._summary_menu_item, "📋 盘面总结")
 
         if show_window and self._summary_text:
             # 手动触发，打开 TextEdit
             self._show_summary_in_textedit(self._summary_text)
         elif not show_window:
             # 定时触发，只缓存不弹窗，菜单加上日期提示
-            self._summary_menu_item.title = f"📋 盘面总结（{self._last_summary_date}）"
+            replace_menu_item_title(
+                self._summary_menu_item,
+                f"📋 盘面总结（{self._last_summary_date}）",
+            )
             self.log("盘面总结已定时生成并缓存", "INFO")
         elif not self._summary_text:
             self._alert(title="盘面总结", message="生成失败，请查看日志。")
@@ -3267,6 +3308,7 @@ class StockMenuBar(rumps.App):
         """
         result = []
         relaxed_result = []
+        strong_result = []
         five_one_three_result = []
         stats = {
             'total_stocks': 0,
@@ -3355,12 +3397,16 @@ class StockMenuBar(rumps.App):
                         today=datetime.now().strftime("%Y-%m-%d"),
                         current_price=float(close.iloc[-1]),
                     )
+                    strong_candidate = self._strong_candidate_from_bars(
+                        code, name, five_bars,
+                    )
                     if not include_indicators:
                         return {
                             'data': None,
                             'strict': False,
                             'relaxed': False,
                             'five_one_three': inspection['hit'],
+                            'strong': None,
                             'inspection': inspection,
                         }
 
@@ -3457,6 +3503,7 @@ class StockMenuBar(rumps.App):
                         'strict': strict_macd_ok and strict_rsi_ok and strict_kdj_ok,
                         'relaxed': relaxed_score >= 2,
                         'five_one_three': inspection['hit'],
+                        'strong': strong_candidate,
                         'inspection': inspection,
                     }
                 except Exception:
@@ -3491,6 +3538,9 @@ class StockMenuBar(rumps.App):
                                     stats['waiting_confirmation'] += 1
                                 elif five_hit['stage'] == FiveOneThreeStage.CONFIRMED:
                                     stats['confirmed'] += 1
+                            strong_candidate = screen_result.get('strong')
+                            if strong_candidate:
+                                strong_result.append(strong_candidate)
                         else:
                             failed_history += 1
                     except Exception:
@@ -3516,8 +3566,13 @@ class StockMenuBar(rumps.App):
             result = order_strict_hits(result)
             relaxed_result = order_relaxed_hits(relaxed_result)
             five_one_three_result = order_five_one_three_hits(five_one_three_result)
+            strong_result.sort(key=lambda item: (
+                not item.get("eligible_candidate", False),
+                -float(item.get("price") or 0),
+            ))
             self.log(
                 f"指标选股完成: 严格 {len(result)} 只，宽松预警 {len(relaxed_result)} 只，"
+                f"强势延续 {len(strong_result)} 只，"
                 f"513形态 {len(five_one_three_result)} 只"
                 f"（历史5连阳{stats['historical_five_bullish']} / "
                 f"当前5连阳{stats['recent_five_bullish']}）",
@@ -3531,6 +3586,7 @@ class StockMenuBar(rumps.App):
         return {
             'strict': result,
             'relaxed': relaxed_result,
+            'strong': strong_result,
             'five_one_three': five_one_three_result,
             'stats': stats,
             'scanned_codes': set(spot_df['代码']),
@@ -3853,7 +3909,7 @@ class StockMenuBar(rumps.App):
         """
         cached = self._last_daily_report
         if not cached:
-            self._portfolio_info_menu_item.title = "📦 持仓信息"
+            replace_menu_item_title(self._portfolio_info_menu_item, "📦 持仓信息")
             self._portfolio_info_menu_item.clear()
             self._portfolio_info_menu_item.add(
                 rumps.MenuItem("📄 打开完整报告", callback=self.show_daily_report)
@@ -3866,7 +3922,7 @@ class StockMenuBar(rumps.App):
 
         overview = cached.get("overview") or {}
         meta = cached.get("meta") or {}
-        self._portfolio_info_menu_item.title = menu_title(overview, meta)
+        replace_menu_item_title(self._portfolio_info_menu_item, menu_title(overview, meta))
 
         self._portfolio_info_menu_item.clear()
         self._portfolio_info_menu_item.add(
@@ -3912,7 +3968,7 @@ class StockMenuBar(rumps.App):
                 )
             else:
                 try:
-                    self._market_overview_menu_item.title = overview_title
+                    replace_menu_item_title(self._market_overview_menu_item, overview_title)
                 except Exception as e:
                     self.log(
                         f"指数菜单更新失败: 标题写入 {e}\n{traceback.format_exc()}",
@@ -4221,6 +4277,7 @@ class StockMenuBar(rumps.App):
             self._merge_screen_results(
                 strict=round_result["strict"],
                 relaxed=round_result["relaxed"],
+                strong=round_result.get("strong", []),
                 five=round_result["five_one_three"],
                 stats=round_result.get("stats"),
                 include_patterns=full_market,
@@ -4228,7 +4285,8 @@ class StockMenuBar(rumps.App):
             )
             self._refresh_observation_pool(
                 self._observation_hits(round_result["strict"], round_result["relaxed"],
-                                       round_result["five_one_three"]),
+                                       round_result["five_one_three"],
+                                       round_result.get("strong", [])),
                 completed_at,
             )
             if mode == "auto":
@@ -4246,7 +4304,7 @@ class StockMenuBar(rumps.App):
             return False
         return (datetime.now() - at).total_seconds() <= self.SCREEN_STALE_RETENTION_DAYS * 86400
 
-    def _merge_screen_results(self, *, strict, relaxed, five, stats, include_patterns, completed_at):
+    def _merge_screen_results(self, *, strict, relaxed, strong=(), five, stats, include_patterns, completed_at):
         """按列表各自保留 + 按组记时间 + 落盘。
 
         某档本次为空、上次非空**且还在保质期内**就沿用上次；指标快扫不动趋势/513/统计。
@@ -4254,32 +4312,35 @@ class StockMenuBar(rumps.App):
         """
         prev_strict = list(self.indicator_data)
         prev_relaxed = list(self.relaxed_indicator_data)
+        prev_strong = list(getattr(self, "strong_candidate_data", []))
         prev_five = list(self.five_one_three_data)
         indicator_retained = self._screen_group_fresh(self._indicator_group_at)
         pattern_retained = self._screen_group_fresh(self._pattern_group_at)
 
         strict_kept = bool(prev_strict) and not strict and indicator_retained
         relaxed_kept = bool(prev_relaxed) and not relaxed and indicator_retained
+        strong_kept = bool(prev_strong) and not strong and indicator_retained
         five_kept = include_patterns and bool(prev_five) and not five and pattern_retained
 
         self.indicator_data = prev_strict if strict_kept else list(strict)
         self.relaxed_indicator_data = prev_relaxed if relaxed_kept else list(relaxed)
+        self.strong_candidate_data = prev_strong if strong_kept else list(strong)
         if include_patterns:
             self.five_one_three_data = prev_five if five_kept else list(five)
             if stats is not None:
                 self.five_one_three_stats = stats
 
-        if not strict_kept and not relaxed_kept:
+        if not strict_kept and not relaxed_kept and not strong_kept:
             self._indicator_group_at = completed_at
         if include_patterns and not five_kept:
             self._pattern_group_at = completed_at
 
-        kept_any = strict_kept or relaxed_kept or five_kept
+        kept_any = strict_kept or relaxed_kept or strong_kept or five_kept
         self.indicator_results_stale = kept_any
         kept_times = [
             at
             for at, kept in (
-                (self._indicator_group_at, strict_kept or relaxed_kept),
+                (self._indicator_group_at, strict_kept or relaxed_kept or strong_kept),
                 (self._pattern_group_at, five_kept),
             )
             if kept and at
@@ -4290,8 +4351,89 @@ class StockMenuBar(rumps.App):
         return kept_any
 
     @staticmethod
-    def _observation_hits(strict, relaxed, five):
-        """把三档选股结果归一成观察池所需的信号来源。"""
+    def _strong_candidate_from_bars(code, name, bars):
+        if len(bars) < 25:
+            return None
+        closes = [float(bar["close"]) for bar in bars]
+        highs = [float(bar["high"]) for bar in bars]
+        lows = [float(bar["low"]) for bar in bars]
+        volumes = [float(bar["volume"]) for bar in bars]
+        if not all(math.isfinite(value) and value > 0 for value in closes + highs + lows + volumes):
+            return None
+        if any(not lows[index] <= min(float(bars[index]["open"]), closes[index]) <= max(float(bars[index]["open"]), closes[index]) <= highs[index]
+               for index in range(len(bars))):
+            return None
+        ma5 = sum(closes[-5:]) / 5
+        ma10 = sum(closes[-10:]) / 10
+        ma20 = sum(closes[-20:]) / 20
+        ma20_prev = sum(closes[-21:-1]) / 20
+        sample = bars[-60:]
+        low60 = min(float(bar["low"]) for bar in sample)
+        high60 = max(float(bar["high"]) for bar in sample)
+        if high60 > low60:
+            location_ratio = (closes[-1] - low60) / (high60 - low60)
+            price_location = (
+                "HIGH" if location_ratio >= 0.85
+                else "LOW" if location_ratio <= 0.15
+                else "MID"
+            )
+        else:
+            price_location = "MID"
+        average_volume20 = sum(volumes[-20:]) / min(20, len(volumes))
+        recent_lows = lows[-3:]
+        previous_lows = lows[-6:-3]
+        result = assess_strong_continuation(StrongContinuationInput(
+            price=closes[-1],
+            ma5=ma5,
+            ma10=ma10,
+            ma20=ma20,
+            ma20_prev=ma20_prev,
+            price_location=price_location,
+            bias_pct=(closes[-1] - ma5) / ma5 * 100 if ma5 else 0.0,
+            breakout_reference=max(closes[:-5]) if len(closes) > 5 else None,
+            volume_ratio=volumes[-1] / average_volume20 if average_volume20 else None,
+            lower_pivots_rising=(
+                min(recent_lows) >= min(previous_lows) if previous_lows else None
+            ),
+            support_holds=lows[-1] >= min(lows[-20:]),
+            market_ok=None,
+            sector_ok=None,
+        ))
+        if result.state.name not in {"STRONG_CONTINUATION", "EXTENDED_CONTINUATION"}:
+            return None
+        hold_result = assess_continuation_hold(ContinuationHoldInput(
+            strong_state=result.state.name,
+            high_state="HIGH_PENDING" if price_location == "HIGH" else "NOT_HIGH",
+            risk_line=result.risk_line.name if result.risk_line else None,
+            risk_price=result.risk_price,
+            bias_pct=(closes[-1] - ma5) / ma5 * 100 if ma5 else 0.0,
+            volume_ratio=volumes[-1] / average_volume20 if average_volume20 else None,
+            first_wave=True,
+            timeframe_ok=None,
+        ))
+        hold_info = continuation_hold_to_dict(hold_result)
+        return {
+            "code": code,
+            "name": name,
+            "price": closes[-1],
+            "strong_state": result.state.name,
+            "strong_state_label": result.state.value,
+            "eligible_candidate": result.eligible_candidate,
+            "risk_line": result.risk_line.name if result.risk_line else None,
+            "risk_price": result.risk_price,
+            "breakout_reference": result.breakout_reference,
+            "price_location": price_location,
+            "bias_pct": (closes[-1] - ma5) / ma5 * 100 if ma5 else 0.0,
+            "volume_ratio": volumes[-1] / average_volume20 if average_volume20 else None,
+            "reasons": list(result.reasons),
+            "blockers": list(result.blockers),
+            "continuation_hold": hold_info,
+            "continuation_state": hold_info["state"],
+        }
+
+    @staticmethod
+    def _observation_hits(strict, relaxed, five, strong=None):
+        """把选股结果归一成观察池所需的信号来源。"""
         hits = []
         for stock in strict or []:
             hits.append({
@@ -4318,6 +4460,18 @@ class StockMenuBar(rumps.App):
                 "name": stock.get("name"),
                 "price": stock.get("price"),
                 "source": source,
+            })
+        for stock in strong or []:
+            hits.append({
+                "code": stock.get("code"),
+                "name": stock.get("name"),
+                "price": stock.get("price"),
+                "source": "strong",
+                "strong_state": stock.get("strong_state"),
+                "risk_line": stock.get("risk_line"),
+                "risk_price": stock.get("risk_price"),
+                "continuation_state": stock.get("continuation_state"),
+                "continuation_hold": stock.get("continuation_hold"),
             })
         return hits
 
@@ -4346,6 +4500,7 @@ class StockMenuBar(rumps.App):
             "pattern_at": _text(self._pattern_group_at),
             "strict": self._json_safe(self.indicator_data),
             "relaxed": self._json_safe(self.relaxed_indicator_data),
+            "strong": self._json_safe(getattr(self, "strong_candidate_data", [])),
             "five_one_three": self._json_safe(self.five_one_three_data),
             "stats": self._json_safe(self.five_one_three_stats),
         }
@@ -4374,6 +4529,7 @@ class StockMenuBar(rumps.App):
         if self._screen_group_fresh(self._indicator_group_at):
             self.indicator_data = payload.get("strict") or []
             self.relaxed_indicator_data = payload.get("relaxed") or []
+            self.strong_candidate_data = payload.get("strong") or []
         if self._screen_group_fresh(self._pattern_group_at):
             self.five_one_three_data = payload.get("five_one_three") or []
             self.five_one_three_stats = payload.get("stats") or self.five_one_three_stats
@@ -4397,7 +4553,7 @@ class StockMenuBar(rumps.App):
                 benchmark = []
                 if targets:
                     try:
-                        benchmark = self.get_stock_analysis_history("sh000001", data_length=240).to_dict("records")
+                        benchmark = self.get_stock_analysis_history("sh000001", data_length=400).to_dict("records")
                     except Exception as error:
                         errors.append(f"大盘日线：{error}")
 
@@ -4409,7 +4565,7 @@ class StockMenuBar(rumps.App):
                             quote = {}
                             issues.append(f"名称获取失败：{error}")
                         try:
-                            bars = self.get_stock_analysis_history(code, data_length=240).to_dict("records")
+                            bars = self.get_stock_analysis_history(code, data_length=400).to_dict("records")
                         except Exception as error:
                             bars = []
                             issues.append(str(error))
@@ -4498,7 +4654,7 @@ class StockMenuBar(rumps.App):
                 code = record["code"]
                 bars = histories.get(code)
                 if not bars:
-                    bars = self.get_stock_analysis_history(code, data_length=240).to_dict("records")
+                    bars = self.get_stock_analysis_history(code, data_length=400).to_dict("records")
                 quote = self.get_stock_data(code)
                 snapshot = fetch_stock_flow_snapshot(code)
                 return bars, quote, snapshot
@@ -4668,6 +4824,11 @@ class StockMenuBar(rumps.App):
                         self.stock_data[code] = data
                 except Exception as e:
                     self.log(f"获取 {code} 数据失败: {e}", "ERROR")
+            # 行情带回真名后，把「名称=代码」的持仓修回可读名称并落盘。
+            # _fetch_data 在后台线程，菜单重建必须回主线程（本方法约定不更新 UI）。
+            if self._heal_position_names():
+                self._save_portfolio()
+                self._dispatch_to_main(self._refresh_portfolio_update_menu)
 
             # 获取市场级成交额（上证 + 深证），不依赖自选股列表
             try:
@@ -5698,6 +5859,41 @@ class StockMenuBar(rumps.App):
             return None, None
         return results[0]["code"], results[0]["name"]
 
+    def _display_stock_name(self, code, name=None):
+        """展示用的股票名称：名称缺失或等于代码时回落到行情缓存里的真名。
+
+        纯代码录入遇搜索接口不可达时，name 会先落成代码（见 _resolve_portfolio_stock），
+        菜单和盘中提醒就会显示一串代码。这里统一兜底，保证看到的是可读名称。
+        """
+        normalized = str(code or "").strip().lower()
+        candidate = str(name or "").strip()
+        if candidate and candidate.lower() != normalized:
+            return candidate
+        live = ((getattr(self, "stock_data", None) or {}).get(normalized) or {})
+        live_name = str(live.get("name") or "").strip()
+        if live_name and live_name.lower() != normalized:
+            return live_name
+        return candidate or normalized
+
+    def _heal_position_names(self):
+        """把「名称=代码」的持仓名补成真名并落盘，返回是否有改动。
+
+        行情每轮都会带回真名，顺手修一次配置，菜单/提醒下次就不再显示代码。
+        """
+        changed = False
+        for item in self.portfolio.get("positions", []):
+            code = str(item.get("code") or "").strip()
+            if not code:
+                continue
+            current = str(item.get("name") or "").strip()
+            if current and current.lower() != code.lower():
+                continue
+            healed = self._display_stock_name(code, current)
+            if healed and healed.lower() != code.lower():
+                item["name"] = healed
+                changed = True
+        return changed
+
     @staticmethod
     def _split_portfolio_input(text):
         normalized = (
@@ -5744,8 +5940,9 @@ class StockMenuBar(rumps.App):
             code = str(item.get("code", ""))
             quantity = self._safe_float(item.get("quantity"))
             cost = self._safe_float(item.get("cost"))
+            display_name = self._display_stock_name(code, item.get("name"))
             menu_item = rumps.MenuItem(
-                f"{item.get('name', code)} ({code}) · {quantity:,.0f}股 @ {cost:.2f}",
+                f"{display_name} ({code}) · {quantity:,.0f}股 @ {cost:.2f}",
                 callback=lambda sender, position_code=code: (
                     self.show_portfolio_position_update(sender, position_code)
                 ),
@@ -5811,7 +6008,7 @@ class StockMenuBar(rumps.App):
                 if entry is None:
                     continue
                 title = self._leader_entry_title(entry, code)
-                item.title = title
+                replace_menu_item_title(item, title)
                 updated += 1
                 if not sample:
                     sample = title
@@ -6274,7 +6471,7 @@ class StockMenuBar(rumps.App):
             self._alert(title="修改数量/成本", message="没有找到要修改的监控股票。")
             return
 
-        name = item.get("name", item.get("code", ""))
+        name = self._display_stock_name(item.get("code"), item.get("name"))
         quantity = self._safe_float(item.get("quantity"))
         cost = self._safe_float(item.get("cost"))
         response = self._window(
@@ -6347,7 +6544,7 @@ class StockMenuBar(rumps.App):
             self._alert(title="修改数量/成本", message="当前没有已配置的监控股票。")
             return
         current = "\n".join(
-            f"- {item.get('name')} ({item.get('code')}) "
+            f"- {self._display_stock_name(item.get('code'), item.get('name'))} ({item.get('code')}) "
             f"{float(item.get('quantity', 0) or 0):.0f}股@{float(item.get('cost', 0) or 0):.2f}"
             for item in positions
         )
@@ -7521,6 +7718,8 @@ class StockMenuBar(rumps.App):
             signal.body or "",
             signal.notification_body or "",
         ))
+        if signal.signal_type == IntradaySignalType.TRADE_WAIT:
+            return "hold"
         if signal.signal_type in {
             IntradaySignalType.BREAK_SUPPORT,
             IntradaySignalType.EXIT_RISK,
@@ -7558,6 +7757,9 @@ class StockMenuBar(rumps.App):
         now=None,
         buy_capacity_quantity=0,
         trade_date=None,
+        permissions=None,
+        trend=None,
+        high_position=None,
     ):
         intent = self._intraday_policy_intent(signal)
         if intent == "hold":
@@ -7632,6 +7834,7 @@ class StockMenuBar(rumps.App):
         invalidation = support if intent == "buy" else 0.0
         decision = evaluate_trade_action(
             intent, evidence, eligibility, invalidation_price=invalidation,
+            permissions=permissions, trend=trend, high_position=high_position,
         )
 
         if decision.action == DecisionAction.WAIT:
@@ -7753,7 +7956,7 @@ class StockMenuBar(rumps.App):
             resistance = result.get("resistance", 0)
             score = result.get("score", 0)
             quantity = result.get("quantity", 0)
-            name = result.get("name", code)
+            name = self._display_stock_name(code, result.get("name"))
             limit_pct = limit_pct_for_board(code)
             vr = volume_ratio if volume_ratio > 0 else None
             market_context = self._intraday_market_context(code)
@@ -7812,6 +8015,11 @@ class StockMenuBar(rumps.App):
                 and recent_up_days_5d is not None
                 and recent_up_days_5d <= 1
             )
+            trend_policy = {
+                "trade_permissions": entry.get("trade_permissions"),
+                "trend": entry.get("trend_assessment"),
+                "high_position": entry.get("high_position"),
+            }
 
             # ── 记录tick数据用于置信度计算 ──
             conditions = {
@@ -7880,6 +8088,7 @@ class StockMenuBar(rumps.App):
                 recent_trend=recent_trend,
                 trend_weak=trend_weak,
                 price_location=price_location,
+                **trend_policy,
                 **market_context["values"],
                 **deep_context,
             )
@@ -7913,6 +8122,7 @@ class StockMenuBar(rumps.App):
                 recent_trend=recent_trend,
                 trend_weak=trend_weak,
                 price_location=price_location,
+                **trend_policy,
                 **market_context["values"],
                 **deep_context,
             )
@@ -7930,6 +8140,9 @@ class StockMenuBar(rumps.App):
                     signal, code, name, price, support, resistance,
                     buy_capacity_quantity=buy_capacity_quantity,
                     trade_date=trade_date,
+                    permissions=entry.get("trade_permissions"),
+                    trend=entry.get("trend_assessment"),
+                    high_position=entry.get("high_position"),
                 )
                 if signal.signal_type in {
                     IntradaySignalType.T_HOLD,
@@ -8446,6 +8659,12 @@ class StockMenuBar(rumps.App):
                     # 写回行情缓存：晚启动/收盘后 _fetch_data 不刷行情，
                     # 不写的话 _quote_date_of() 读不到 date，今日报告会永远定不了稿。
                     self.stock_data[position["code"]] = live
+                    # 名称落成代码的持仓在此补真名：盘中信号标题直接取 position["name"]
+                    live_name = str((live or {}).get("name") or "").strip()
+                    if live_name and str(position.get("name") or "").strip().lower() in (
+                        "", str(position.get("code") or "").strip().lower()
+                    ):
+                        position["name"] = live_name
                     history = self.get_stock_analysis_history(position["code"], data_length=240)
                     benchmark = None
                     if position["code"] != "sh000001":
@@ -8621,6 +8840,46 @@ class StockMenuBar(rumps.App):
                 turnover_label = "较前一交易日同期"
                 turnover_session = "同期成交额未取到"
 
+        cycle_history_rows = (
+            self.turnover_tracker.recent_full_day_turnover_history(
+                quote_date, limit=5
+            )
+            if self.turnover_tracker else ()
+        )
+        cycle_history = [value for _, value in cycle_history_rows]
+        cycle_history_dates = [day for day, _ in cycle_history_rows]
+        preliminary_cycle = assess_market_cycle(MarketCycleInput(
+            predicted_turnover_yi=turnover_today,
+            turnover_history_yi=cycle_history,
+            turnover_history_dates=cycle_history_dates,
+            turnover_history_as_of_date=quote_date,
+            index_today_pct=index_pct,
+            industry_breadth=sector_breadth,
+        ))
+        state_store = getattr(self, "market_cycle_state_store", None)
+        cycle_state = (
+            state_store.observe(
+                preliminary_cycle.phase,
+                quote_date,
+                finalized=mode == "finalize",
+                evidence=preliminary_cycle.reasons[:2],
+            )
+            if state_store and quote_date else None
+        )
+        cycle_assessment = assess_market_cycle(MarketCycleInput(
+            predicted_turnover_yi=turnover_today,
+            turnover_history_yi=cycle_history,
+            turnover_history_dates=cycle_history_dates,
+            turnover_history_as_of_date=quote_date,
+            index_today_pct=index_pct,
+            industry_breadth=sector_breadth,
+            phase_hint=cycle_state.phase if cycle_state else preliminary_cycle.phase,
+            phase_age_days=cycle_state.phase_age_days if cycle_state else None,
+            divergence_age_days=(
+                cycle_state.divergence_age_days if cycle_state else None
+            ),
+            down_age_days=cycle_state.down_age_days if cycle_state else None,
+        ))
         market_timing = format_market_timing_data(
             quote_date,
             index_today_pct=index_pct,
@@ -8630,6 +8889,7 @@ class StockMenuBar(rumps.App):
             turnover_session=turnover_session,
             turnover_source="TurnoverTracker",
             turnover_scope="沪深两市",
+            market_cycle_text=format_market_cycle_assessment(cycle_assessment),
             sector_breadth=sector_breadth,
             sector_breadth_label="全市场行业板块上涨占比",
             sector_breadth_date=quote_date,
@@ -8873,7 +9133,7 @@ class StockMenuBar(rumps.App):
         if not self._technical_analysis_lock.acquire(blocking=False):
             self._alert(title="个股分析", message="已有分析任务正在执行，请稍候。")
             return
-        self._technical_analysis_menu_item.title = f"🔍 分析中 · {name}"
+        replace_menu_item_title(self._technical_analysis_menu_item, f"🔍 分析中 · {name}")
         threading.Thread(
             target=self._run_stock_technical_analysis,
             args=(code, name),
@@ -8941,7 +9201,7 @@ class StockMenuBar(rumps.App):
 
         def _finish():
             self._technical_analysis_lock.release()
-            self._technical_analysis_menu_item.title = "🔍 个股分析"
+            replace_menu_item_title(self._technical_analysis_menu_item, "🔍 个股分析")
             if report:
                 self._show_technical_analysis_in_textedit(report)
             else:
@@ -9008,7 +9268,7 @@ class StockMenuBar(rumps.App):
             self._alert(title="格式错误", message="请输入正确的股票代码，例如 sh600519。")
             return
 
-        self._fundamentals_menu_item.title = f"📊 分析中 · {name}"
+        replace_menu_item_title(self._fundamentals_menu_item, f"📊 分析中 · {name}")
         threading.Thread(
             target=self._run_fundamentals_analysis,
             args=(code, name),
@@ -9064,7 +9324,7 @@ class StockMenuBar(rumps.App):
             self.log(traceback.format_exc(), "ERROR")
 
         def _finish():
-            self._fundamentals_menu_item.title = "📊 基本面分析"
+            replace_menu_item_title(self._fundamentals_menu_item, "📊 基本面分析")
             if report:
                 path = os.path.join(self.log_dir, "_fundamentals_report.txt")
                 try:
@@ -9108,7 +9368,7 @@ class StockMenuBar(rumps.App):
         keyword = response.text.strip()
         if not keyword:
             return
-        self._global_menu_item.title = "🌎 分析中…"
+        replace_menu_item_title(self._global_menu_item, "🌎 分析中…")
         threading.Thread(
             target=self._run_global_analysis,
             args=(keyword,),
@@ -9129,7 +9389,7 @@ class StockMenuBar(rumps.App):
             self.log(traceback.format_exc(), "ERROR")
 
         def _finish():
-            self._global_menu_item.title = "🌎 港美股分析"
+            replace_menu_item_title(self._global_menu_item, "🌎 港美股分析")
             if report:
                 path = os.path.join(self.log_dir, "_global_fundamentals_report.txt")
                 try:
@@ -9175,7 +9435,7 @@ class StockMenuBar(rumps.App):
         keyword = response.text.strip()
         if not keyword:
             return
-        self._ai_menu_item.title = "🤖 思考中…"
+        replace_menu_item_title(self._ai_menu_item, "🤖 思考中…")
         threading.Thread(
             target=self._run_ai_analysis,
             args=(keyword,),
@@ -9212,7 +9472,7 @@ class StockMenuBar(rumps.App):
             self.log(traceback.format_exc(), "ERROR")
 
         def _finish():
-            self._ai_menu_item.title = "🤖 AI 分析"
+            replace_menu_item_title(self._ai_menu_item, "🤖 AI 分析")
             if report:
                 path = os.path.join(self.log_dir, ai_analysis.REPORT_FILE)
                 try:
@@ -9563,9 +9823,9 @@ class StockMenuBar(rumps.App):
     def _update_float_menu_title(self):
         mode = "菜单" if self.floating_window.expanded else "紧凑"
         if self.floating_window.visible:
-            self._float_menu_item.title = f"📌 浮动窗口 ✓ ({mode})"
+            replace_menu_item_title(self._float_menu_item, f"📌 浮动窗口 ✓ ({mode})")
         else:
-            self._float_menu_item.title = "📌 浮动窗口"
+            replace_menu_item_title(self._float_menu_item, "📌 浮动窗口")
 
     @rumps.clicked("❌ 退出")
     def quit_app(self, _):

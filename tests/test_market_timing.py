@@ -80,6 +80,16 @@ class MarketTimingTests(unittest.TestCase):
         self.assertIn("数据口径", text)
         self.assertIn("TurnoverTracker", text)
 
+    def test_market_cycle_prior_is_explicit_and_non_actionable(self):
+        text = format_market_timing_data(
+            date_value="2026-10-12",
+            index_today_pct=1.0,
+            market_cycle_text="阶段=上涨；上涨参考4–6天；分歧参考3–4天；下跌参考5–8天。天数仅作风险窗口参考，结构破位优先，不构成交易信号。",
+        )
+        self.assertIn("行情节奏：阶段=上涨", text)
+        self.assertIn("上涨参考4–6天", text)
+        self.assertIn("不构成交易信号", text)
+
 
 if __name__ == "__main__":
     unittest.main()

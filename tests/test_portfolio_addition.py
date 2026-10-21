@@ -9,6 +9,7 @@ from portfolio_addition import (
     Bar,
     FundamentalSnapshot,
     HoldingAssessmentInput,
+    assess_holding,
     calculate_ma250,
     fundamental_blockers,
     resample_ohlcv,
@@ -149,6 +150,101 @@ class SizingAndRankingTests(unittest.TestCase):
 
 
 class CandidateSelectionTests(unittest.TestCase):
+    def _history(self):
+        return pd.DataFrame([{
+            "date": (datetime(2025, 1, 1) + pd.Timedelta(days=index)).strftime("%Y-%m-%d"),
+            "open": 10, "high": 11, "low": 9,
+            "close": 10 + index * 0.05, "volume": 1000,
+        } for index in range(1250)])
+
+    def _fundamental(self):
+        return FundamentalSnapshot(
+            analyzed_at="2026-10-15", score=90, health_level="SOUND",
+            revenue_yoy=15, profit_yoy=20, deduct_ratio=0.95,
+            gross_margin=35, net_margin=18, ocf_to_profit=1.1, roe=15,
+            current_pe=15, current_pb=2, pe_percentile=25,
+            pb_percentile=25, fair_low=8, fair_high=12,
+        )
+
+    def test_major_down_recommendation_has_zero_new_capital(self):
+        item = HoldingAssessmentInput(
+            code="sh600001", name="甲", quantity=1000, cost=10, price=15,
+            total_capital=100000, available_capital=50000, max_position_pct=20,
+            daily_history=self._history(),
+            technical={
+                "score": 6,
+                "entry_can_buy": True,
+                "trend_weak": False,
+                "entry_stop_price": 14.0,
+                "trend_assessment": {"major_trend": "大趋势向下"},
+            },
+            fundamental=self._fundamental(),
+        )
+
+        result = assess_holding(item, datetime(2026, 10, 15, 15))
+
+        self.assertFalse(result.selected)
+        self.assertEqual(result.shares, 0)
+        self.assertEqual(result.amount, 0)
+        self.assertTrue(any("大趋势向下" in reason for reason in result.reasons))
+
+    def test_bottoming_probe_is_capped_at_quarter_initial_position(self):
+        item = HoldingAssessmentInput(
+            code="sh600001", name="甲", quantity=0, cost=0, price=10,
+            total_capital=100000, available_capital=50000, max_position_pct=20,
+            daily_history=self._history(),
+            technical={
+                "score": 6,
+                "entry_can_buy": True,
+                "trend_weak": False,
+                "entry_stop_price": 9.5,
+                "trend_assessment": {"major_trend": "筑底阶段"},
+                "high_position": {"state": "非高位"},
+                "trade_permissions": {
+                    "allow_probe": True,
+                    "probe_cap_amount": 1250.0,
+                },
+            },
+            fundamental=self._fundamental(),
+            initial_entry_pct=5.0,
+        )
+
+        result = assess_holding(item, datetime(2026, 10, 15, 15))
+
+        self.assertFalse(result.selected)
+        self.assertEqual(result.shares, 100)
+        self.assertEqual(result.amount, 1000.0)
+        self.assertLessEqual(result.amount, 100000 * 0.05 * 0.25)
+
+    def test_high_risk_or_second_wave_candidate_gets_no_new_capital(self):
+        for high_state in ("高位派发风险", "二波候选"):
+            with self.subTest(high_state=high_state):
+                item = HoldingAssessmentInput(
+                    code="sh600001", name="甲", quantity=1000, cost=10, price=15,
+                    total_capital=100000, available_capital=50000, max_position_pct=20,
+                    daily_history=self._history(),
+                    technical={
+                        "score": 6,
+                        "entry_can_buy": True,
+                        "trend_weak": False,
+                        "entry_stop_price": 14.0,
+                        "trend_assessment": {"major_trend": "大趋势向上"},
+                        "high_position": {"state": high_state},
+                        "trade_permissions": {"allow_add": False},
+                    },
+                    fundamental=self._fundamental(),
+                )
+
+                result = assess_holding(item, datetime(2026, 10, 15, 15))
+
+                self.assertFalse(result.selected)
+                self.assertEqual(result.shares, 0)
+                self.assertEqual(result.amount, 0)
+                self.assertTrue(any(
+                    high_state in reason or "高位结构" in reason
+                    for reason in result.reasons
+                ))
+
     def test_no_fundamental_snapshot_is_not_recommended(self):
         source = pd.DataFrame([{
             "date": (datetime(2025, 1, 1) + pd.Timedelta(days=index)).strftime("%Y-%m-%d"),

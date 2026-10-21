@@ -368,6 +368,25 @@ class TurnoverTracker:
             values.append(float(samples.get(self._CLOSE_SAMPLE_KEY, float('nan'))))
         return values
 
+    def recent_full_day_turnover_history(
+        self, before_date: Optional[str] = None, limit: int = 5
+    ) -> List[Tuple[str, float]]:
+        """返回此前完整收盘日的日期和成交额；缺收盘采样的日期直接跳过。"""
+        dates = sorted(self._data)
+        if before_date:
+            dates = [date for date in dates if date < before_date]
+        values: List[Tuple[str, float]] = []
+        for date in dates[-max(1, limit):]:
+            samples = self._data.get(date) or {}
+            value = samples.get(self._CLOSE_SAMPLE_KEY)
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                continue
+            if number > 0:
+                values.append((date, number))
+        return values
+
     # ------------------------------------------------------------------
     # 核心采样
     # ------------------------------------------------------------------

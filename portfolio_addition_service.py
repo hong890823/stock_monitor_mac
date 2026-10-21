@@ -126,7 +126,11 @@ class PortfolioAdditionService:
     ) -> HoldingAssessmentInput:
         code = str(position.get("code", "") or "")
         name = str(position.get("name", "") or code)
-        technical = technical_by_code.get(code) or {}
+        technical = dict(technical_by_code.get(code) or {})
+        entry_info = dict(technical.get("entry_structure") or {})
+        for key in ("trend_assessment", "high_position", "trade_permissions"):
+            if key not in technical and key in entry_info:
+                technical[key] = entry_info[key]
         missing: List[str] = []
         try:
             history = self.history_fetcher(code, data_length=1250)
@@ -150,6 +154,7 @@ class PortfolioAdditionService:
             technical=dict(technical),
             fundamental=fundamental,
             missing=tuple(missing),
+            initial_entry_pct=_finite(position.get("initial_entry_pct"), 5.0),
         )
 
     def prepare_inputs(
@@ -164,6 +169,7 @@ class PortfolioAdditionService:
                 "total_capital": positions.get("total_capital"),
                 "available_capital": positions.get("available_capital"),
                 "max_position_pct": positions.get("max_position_pct", 20),
+                "initial_entry_pct": positions.get("initial_entry_pct", 5),
             }
             holdings = [
                 {**defaults, **position}
@@ -195,5 +201,8 @@ class PortfolioAdditionService:
                         technical=dict(technical_by_code.get(code) or {}),
                         fundamental=self.store.load(code),
                         missing=(f"加仓数据准备失败：{error}",),
+                        initial_entry_pct=_finite(
+                            position.get("initial_entry_pct"), 5.0
+                        ),
                     )
         return [results[index] for index in range(len(holdings))]

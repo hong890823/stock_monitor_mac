@@ -40,3 +40,23 @@ class MarketSummaryEnvironmentTests(unittest.TestCase):
         self.assertIn('环境判断：放量分歧', report)
         conclusion = next(line for line in report.splitlines() if line.startswith('📌 核心结论：'))
         self.assertIn('放量分歧', conclusion)
+
+    def test_summary_includes_five_level_activity_and_dynamic_cycle_window(self):
+        app = StockMenuBar.__new__(StockMenuBar)
+        quote = dict(price=3200, high=3300, low=3150, open=3190,
+                     prev_close=3190, change_pct=1.0, date='2026-10-15')
+        app.stock_data = {code: dict(quote) for code in ('sh000001', 'sz399001', 'sz399006')}
+        app.sector_data = {'_all': [{'name': '行业甲', 'change': 1.0}], 'top': [], 'bottom': []}
+        app._limit_stocks = {}
+        app._turnover_snapshot = Snapshot('14:30', 195, 25000, 22000, 24000, 27000, Source.LOCAL)
+        app.turnover_tracker = mock.Mock()
+        app.turnover_tracker.recent_full_day_turnovers.return_value = [21000, 22000, 23000, 24000, 25000]
+        app.get_concept_summary_data = mock.Mock(return_value={'sectors': [], 'rising': 80, 'falling': 20})
+        app.get_kline_data = mock.Mock(return_value=[])
+        app._market_turnover_lines = mock.Mock(return_value=['全天预估27,000亿'])
+
+        report = app.generate_market_summary()
+
+        self.assertIn('量能活跃度=比较强', report)
+        self.assertIn('上涨参考', report)
+        self.assertIn('天数仅作风险窗口参考', report)

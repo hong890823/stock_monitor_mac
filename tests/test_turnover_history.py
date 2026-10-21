@@ -21,3 +21,16 @@ class TurnoverHistoryTests(unittest.TestCase):
             self.assertEqual(len(history), 2)
             self.assertEqual(history[0], 16000)
             self.assertTrue(isnan(history[1]))
+
+    def test_dated_history_returns_only_prior_complete_close_days(self):
+        with tempfile.TemporaryDirectory() as directory:
+            tracker = TurnoverTracker(str(Path(directory) / 'history.json'))
+            tracker.sample(16000, datetime(2026, 10, 9, 15, 0), force_record=True)
+            tracker.sample(17000, datetime(2026, 10, 12, 14, 45), force_record=True)
+            tracker.sample(22000, datetime(2026, 10, 13, 15, 0), force_record=True)
+
+            history = tracker.recent_full_day_turnover_history(
+                '2026-10-13', limit=5
+            )
+
+            self.assertEqual(history, [('2026-10-09', 16000.0)])

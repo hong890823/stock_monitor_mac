@@ -31,7 +31,8 @@ class _Health:
         self.reasons = reasons or ["评分 40（较差）"]
 
 
-def _technical(price=30.0, support=30.5, resistance=32.5, trend_weak=False, price_location=None):
+def _technical(price=30.0, support=30.5, resistance=32.5, trend_weak=False,
+               price_location=None, continuation_hold=None):
     technical = {
         "price": price,
         "support": support,
@@ -52,12 +53,15 @@ def _technical(price=30.0, support=30.5, resistance=32.5, trend_weak=False, pric
             "blockers": [],
         },
     }
+    if continuation_hold:
+        technical["continuation_hold"] = continuation_hold
     if price_location:
         technical["price_position"] = {"location_key": price_location}
     return technical
 
 
-def _evaluate(cost=45.0, price=30.0, support=30.5, trend_weak=False, health=None, price_location=None):
+def _evaluate(cost=45.0, price=30.0, support=30.5, trend_weak=False,
+              health=None, price_location=None, continuation_hold=None):
     return evaluate_position(
         position={"code": "sh600522", "name": "中天科技", "quantity": 500, "cost": cost},
         technical=_technical(
@@ -65,6 +69,7 @@ def _evaluate(cost=45.0, price=30.0, support=30.5, trend_weak=False, health=None
             support=support,
             trend_weak=trend_weak,
             price_location=price_location,
+            continuation_hold=continuation_hold,
         ),
         live_data={},
         portfolio={
@@ -88,6 +93,52 @@ class TestBreakPriority(unittest.TestCase):
     def test_trend_weak_still_used_without_break(self):
         result = _evaluate(price=31.0, support=30.5, trend_weak=True)
         self.assertEqual(result["signal"], "趋势转弱观察")
+
+
+class TestContinuationHold(unittest.TestCase):
+    def test_intact_first_wave_keeps_observation_position(self):
+        result = _evaluate(
+            price=31.0,
+            continuation_hold={
+                "state": "HOLD_CONTINUATION",
+                "keep_observation_position": True,
+                "can_trim": False,
+            },
+        )
+        self.assertEqual(result["continuation_state"], "HOLD_CONTINUATION")
+        self.assertIn("保留观察仓", result["action"])
+        self.assertNotIn("约减出", result["action"])
+
+    def test_extended_first_wave_suggests_partial_profit_not_full_exit(self):
+        result = _evaluate(
+            price=32.2,
+            continuation_hold={
+                "state": "PROFIT_PROTECTION",
+                "keep_observation_position": True,
+                "can_trim": True,
+                "risk_line": "MA5",
+                "risk_price": 30.8,
+            },
+        )
+        self.assertEqual(result["continuation_state"], "PROFIT_PROTECTION")
+        self.assertIn("部分兑现", result["action"])
+        self.assertIn("保留观察仓", result["action"])
+        self.assertNotIn("约减出 1/3", result["action"])
+
+    def test_break_defense_wins_over_profit_protection(self):
+        result = _evaluate(
+            price=31.0,
+            continuation_hold={
+                "state": "BREAK_DEFENSE",
+                "keep_observation_position": False,
+                "can_trim": True,
+                "risk_line": "MA5",
+                "risk_price": 31.2,
+            },
+        )
+        self.assertEqual(result["continuation_state"], "BREAK_DEFENSE")
+        self.assertIn("破位防守", result["action"])
+        self.assertNotIn("保留观察仓", result["action"])
 
 
 class TestBreakActions(unittest.TestCase):
@@ -220,6 +271,28 @@ class TestStaleDataLabel(unittest.TestCase):
         self.assertEqual(result["data_age_days"], 0)
         header = format_report(result).splitlines()[1]
         self.assertNotIn("数据已落后", header)
+
+
+class TestGeneratedContinuationHold(unittest.TestCase):
+    def test_analyze_history_publishes_unified_hold_state(self):
+        from stock_analysis import analyze_history, format_report
+
+        result = analyze_history(_kline_frames(start=None, n=80), "sh600118", "中国卫星")
+        self.assertIn("continuation_hold", result["entry_structure"])
+        self.assertEqual(
+            result["continuation_hold"]["state"],
+            result["entry_structure"]["continuation_hold"]["state"],
+        )
+        self.assertIn(result["continuation_hold"]["state"], {
+            "HOLD_CONTINUATION",
+            "PROFIT_PROTECTION",
+            "SECOND_WAVE_WATCH",
+            "SECOND_WAVE_CONFIRMED",
+            "BREAK_DEFENSE",
+            "DISTRIBUTION_RISK",
+            "MISSING",
+        })
+        self.assertIn("持有策略", format_report(result))
 
 
 class TestSituationNotes(unittest.TestCase):

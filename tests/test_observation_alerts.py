@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from capital_flow import CapitalFlowSnapshot
-from observation_alerts import ObservationEntryTracker, is_entry_session
+from observation_alerts import ObservationEntryTracker, format_strong_risk, is_entry_session
 from observation_pool import ObservationPool
 from tests.test_observation_pool import _bars, _hit
 
@@ -18,6 +18,8 @@ def observed_pool(path=None):
                 histories={"sh600001": _bars("2026-10-12")}, benchmark=_bars("2026-10-12"))
     pool.review([], datetime(2026, 10, 13, 18),
                 histories={"sh600001": _bars("2026-10-13")}, benchmark=_bars("2026-10-13"))
+    permissions = pool.records["sh600001"].setdefault("trade_permissions", {})
+    permissions["allow_normal_buy"] = True
     return pool
 
 
@@ -61,6 +63,26 @@ class ObservationEntryTests(unittest.TestCase):
         self.assertIn("失效", alert["body"])
         self.assertEqual(alert["code"], "sh600001")
         self.assertAlmostEqual(alert["price"], 11.16)
+
+    def test_alert_body_starts_with_trend_then_high_position(self):
+        self.check(0)
+        self.check(1)
+        alert = self.check(2)
+
+        self.assertIsNotNone(alert)
+        self.assertIn("短期趋势", alert["body"])
+        self.assertIn("大趋势", alert["body"])
+        self.assertIn("高位结构", alert["body"])
+        self.assertIn("保留观察仓", alert["body"])
+        self.assertLess(alert["body"].index("大趋势"), alert["body"].index("资金"))
+        self.assertLess(alert["body"].index("高位结构"), alert["body"].index("资金"))
+
+    def test_false_trade_permission_blocks_alert(self):
+        record = dict(self.pool.records["sh600001"])
+        record["trade_permissions"] = {"allow_normal_buy": False}
+
+        for minute in (0, 1, 2):
+            self.assertIsNone(self.check(minute, record=record))
 
     def test_limit_and_near_limit_prices_block_even_with_valid_structure(self):
         for code, price in (("sh600001", 12.41), ("sh600001", 12.35),
@@ -188,6 +210,7 @@ class ObservationEntryTests(unittest.TestCase):
         self.tracker.acknowledge(alert)
         self.pool.review([], datetime(2026, 10, 14, 18),
                          histories={"sh600001": _bars()}, benchmark=_bars())
+        self.pool.records["sh600001"]["trade_permissions"]["allow_normal_buy"] = True
         self.now = datetime(2026, 10, 15, 10)
         self.bars = _bars()
         self.assertIsNone(self.check(0))
@@ -201,3 +224,38 @@ class ObservationEntryTests(unittest.TestCase):
             current_quote["volume"] = 42
             alert = self.check(minute, quote=current_quote)
         self.assertIsNone(alert)
+
+
+class StrongRiskTextTests(unittest.TestCase):
+    def test_report_shows_dynamic_m5_risk_line(self):
+        text = format_strong_risk({
+            "state": "M5_BREAK_RISK",
+            "risk_line": "MA5",
+            "risk_price": 11.0,
+            "confirmed": True,
+        })
+        self.assertIn("跌破五日线风险", text)
+        self.assertIn("风险参考 11.00", text)
+        self.assertIn("破位确认", text)
+        self.assertNotIn("自动卖出", text)
+
+    def test_unconfirmed_m20_break_is_a_risk_warning(self):
+        text = format_strong_risk({
+            "state": "M20_BREAK_RISK",
+            "risk_line": "MA20",
+            "risk_price": 9.6,
+            "confirmed": False,
+        })
+        self.assertIn("跌破二十日线风险", text)
+        self.assertIn("风险预警", text)
+        self.assertIn("风险参考 9.60", text)
+
+    def test_false_break_recovery_reports_risk_released(self):
+        text = format_strong_risk({
+            "state": "STRONG_CONTINUATION",
+            "risk_line": "MA5",
+            "risk_price": 11.0,
+            "risk_released": True,
+        })
+        self.assertIn("风险解除", text)
+        self.assertIn("重新站回", text)

@@ -13,6 +13,8 @@ from enum import Enum
 from math import isfinite
 from typing import Iterable, Optional
 
+from market_turnover_tiers import NEUTRAL_TURNOVER_YI, turnover_activity_label
+
 
 class MarketEnvironmentStatus(Enum):
     STRONG_SUSTAINED = "强势延续"
@@ -22,7 +24,7 @@ class MarketEnvironmentStatus(Enum):
     UNKNOWN = "数据不足"
 
 
-STRONG_TURNOVER_YI = 20_000.0
+STRONG_TURNOVER_YI = NEUTRAL_TURNOVER_YI
 SUSTAINED_TURNOVER_YI = 17_000.0
 MIN_SUSTAINED_AVERAGE_YI = 18_000.0
 MIN_SUSTAINED_DAYS = 3
@@ -55,8 +57,14 @@ class MarketEnvironmentQuality:
     def label(self) -> str:
         return self.status.value
 
+    @property
+    def activity_label(self) -> str:
+        return turnover_activity_label(self.predicted_turnover_yi)
+
     def summary(self) -> str:
-        return "；".join(self.reasons) if self.reasons else self.label
+        parts = list(self.reasons) if self.reasons else [self.label]
+        parts.append(f"量能活跃度={self.activity_label}")
+        return "；".join(parts)
 
 
 def _number(value: object) -> Optional[float]:

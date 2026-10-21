@@ -31,6 +31,7 @@ from urllib.parse import quote
 
 import requests
 from market_timing import format_market_timing_data
+from market_cycle_policy import MarketCycleInput, assess_market_cycle, format_market_cycle_assessment
 from turnover_tracker import TurnoverTracker
 
 DEFAULT_BASE_URL = "https://api.deepseek.com"
@@ -392,24 +393,47 @@ def fetch_northbound_history() -> Any:
     return ak.stock_hsgt_hist_em("北向资金")
 
 
-def _read_turnover_history(project_dir: str):
+def _read_turnover_history(project_dir: str, quote_date: object = None):
     path = os.path.join(project_dir, "_turnover_tracker.json")
     try:
         with open(path, encoding="utf-8") as handle:
             data = json.load(handle)
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         return []
+    excluded_date = _parse_date_text(quote_date)
     rows = []
     for day, slots in (data or {}).items():
+        normalized_day = _parse_date_text(day)
+        if normalized_day is None or normalized_day == excluded_date:
+            continue
         values = []
-        for value in (slots or {}).values():
+        for slot, value in (slots or {}).items():
+            try:
+                slot_number = int(slot)
+            except (TypeError, ValueError):
+                continue
+            if slot_number not in (-1, 240):
+                continue
             try:
                 values.append(float(value))
             except (TypeError, ValueError):
                 continue
         if values:
-            rows.append((day, max(values)))
+            rows.append((normalized_day, max(values)))
     return sorted(rows)[-5:]
+
+
+def _full_day_turnover(slots):
+    values = []
+    for slot, value in (slots or {}).items():
+        try:
+            slot_number = int(slot)
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if slot_number in (-1, 240) and number > 0:
+            values.append(number)
+    return max(values) if values else None
 
 
 def _parse_date_text(value: Any) -> Optional[str]:
@@ -501,7 +525,7 @@ def _read_turnover_evidence(
         return {
             "today": max(today_slots.values()),
             "previous": None,
-            "history": _read_turnover_history(project_dir),
+            "history": _read_turnover_history(project_dir, quote_date),
             "comparison_label": "较前一交易日",
             "session": "未取到前一交易日数据",
             "source": "_turnover_tracker.json",
@@ -516,11 +540,11 @@ def _read_turnover_evidence(
     )
     if after_close:
         today_value = max(today_slots.values())
-        previous_value = max(previous_slots.values())
+        previous_value = _full_day_turnover(previous_slots)
         return {
             "today": today_value,
             "previous": previous_value,
-            "history": _read_turnover_history(project_dir),
+            "history": _read_turnover_history(project_dir, quote_date),
             "comparison_label": "较前一交易日全天",
             "session": "收盘后",
             "source": "_turnover_tracker.json",
@@ -531,7 +555,7 @@ def _read_turnover_evidence(
         return {
             "today": max(today_slots.values()),
             "previous": None,
-            "history": _read_turnover_history(project_dir),
+            "history": _read_turnover_history(project_dir, quote_date),
             "comparison_label": "较前一交易日同期",
             "session": "非交易时段，未比较",
             "source": "_turnover_tracker.json",
@@ -544,7 +568,7 @@ def _read_turnover_evidence(
         return {
             "today": max(today_slots.values()),
             "previous": None,
-            "history": _read_turnover_history(project_dir),
+            "history": _read_turnover_history(project_dir, quote_date),
             "comparison_label": "较前一交易日同期",
             "session": f"盘中截至{TurnoverTracker.slot_text(slot)}",
             "source": "_turnover_tracker.json",
@@ -555,7 +579,7 @@ def _read_turnover_evidence(
     return {
         "today": today_slots[current_slot],
         "previous": previous_slots[previous_slot],
-        "history": _read_turnover_history(project_dir),
+        "history": _read_turnover_history(project_dir, quote_date),
         "comparison_label": "较前一交易日同期",
         "session": f"盘中截至{TurnoverTracker.slot_text(current_slot)}",
         "source": "_turnover_tracker.json",
@@ -612,6 +636,16 @@ def load_market_timing_context(project_dir: str = ".") -> str:
     except (OSError, TypeError, ValueError, json.JSONDecodeError):
         pass
 
+    turnover_history = turnover.get("history", [])
+    cycle = assess_market_cycle(MarketCycleInput(
+        predicted_turnover_yi=turnover.get("today"),
+        turnover_history_yi=[value for _, value in turnover_history],
+        turnover_history_dates=[day for day, _ in turnover_history],
+        turnover_history_as_of_date=quote_date,
+        index_today_pct=index_today,
+        index_recent_pct=index_recent,
+        industry_breadth=breadth,
+    ))
     return format_market_timing_data(
         quote_date or "未取到",
         index_today_pct=index_today,
@@ -632,6 +666,7 @@ def load_market_timing_context(project_dir: str = ".") -> str:
         northbound_3d=(northbound or {}).get("sum_3d") if northbound_matches_quote else None,
         northbound_5d=(northbound or {}).get("sum_5d") if northbound_matches_quote else None,
         northbound_source=(northbound or {}).get("source"),
+        market_cycle_text=format_market_cycle_assessment(cycle),
         holiday_eve=None,
         month_end_near=None,
     )
@@ -991,7 +1026,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "search_web",
-            "description": "联网检索公开网页，返回标题/摘要/链接。用于在项目内数据/规则之外叠加外部视角：行业背景、市场观点、近期事件、公司信息（护城河、批价、竞争格局）。摘要仅供参考，重要结论需标注来源。",
+            "description": "联网检索公开网页，返回标题/摘要/链接。只在需要行业背景、近期事件、公司外部信息或验证时效性事实时调用；纯定义、程序规则或已有本地数据足够时不要调用。摘要仅供参考，重要结论需标注来源。",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1017,7 +1052,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_technical_analysis",
-            "description": "程序的技术面分析摘要（评分/趋势/量价/动量/支撑压力/操作建议），与菜单「个股分析」同口径",
+            "description": "仅用于用户明确询问某个股票或指数的技术面、趋势、量价、支撑压力时；不要为了回答行业或泛概念问题而调用",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string", "description": "代码或名称"}},
@@ -1029,7 +1064,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_fundamentals_report",
-            "description": "程序的基本面分析报告全文（财务质量/估值/主营构成/治理公告/股东结构）。A股用 sh600519 形式；港美股用代码或名称；生成较慢（约10~30秒）",
+            "description": "仅用于用户明确询问个股财务、估值、主营构成、治理或基本面时；行业泛问不调用。A股用 sh600519 形式；港美股用代码或名称；生成较慢（约10~30秒）",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string", "description": "代码或名称"}},
@@ -1041,7 +1076,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_trend_volume",
-            "description": "走势与量能概览（5/20/60 日涨跌幅、60 日区间位置、近5日/20日均量比）",
+            "description": "仅用于用户询问具体股票或指数的走势、量能、区间位置时；不要用于行业泛问或一般概念解释",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string", "description": "代码或名称"}},
@@ -1053,7 +1088,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_recent_news",
-            "description": "最近个股新闻标题列表（东财，含发布时间）",
+            "description": "仅用于用户询问具体个股的近期新闻或事件时；行业新闻可使用 search_web，不需要调用个股新闻工具",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1068,7 +1103,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_market_summary",
-            "description": "最近一次盘面总结缓存（大盘环境、板块动向、市场情绪）",
+            "description": "用于大盘、市场情绪或行业/板块整体动向问题；只问板块时优先使用本工具，不要连带调用个股技术面或基本面",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -1076,7 +1111,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_portfolio_report",
-            "description": "读取最近一次持仓日报（组合盈亏归因、整体技术面、优先处理、逐股明细）；缓存未生成时会明确返回未取到",
+            "description": "仅用于用户询问组合、持仓、盈亏归因或逐股处置时；没有持仓问题就不要调用",
             "parameters": {"type": "object", "properties": {}},
         },
     },
@@ -1084,7 +1119,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_analysis_bundle",
-            "description": "综合分析首选工具：一次读取目标的技术面、基本面、持仓报告、单日盘面总结及最近几日大盘/板块表现；全面分析个股或指数时优先调用",
+            "description": "仅用于用户明确要求对某个个股或指数做综合分析时，一次读取技术面、基本面、持仓、市场和板块背景；普通问答、纯板块问题或只问单一维度时改用更窄的工具",
             "parameters": {
                 "type": "object",
                 "properties": {"code": {"type": "string", "description": "代码或名称"}},
@@ -1211,34 +1246,29 @@ def _dispatch(
 # ──────────────────────────────────────────────────────────────────────────────
 
 QA_SYSTEM_PROMPT = (
-    "你是投资研究助手，服务于个人投资者。用户会自由提问，涉及股票、指数、行业、财经概念，"
-    "或本程序自身的策略与功能。\n"
-    "信息获取原则：**先立足项目自身，再叠加网络信息**。\n"
-    "1. 先用项目内的事实打底：\n"
-    "   - 问题涉及本程序的策略/指标/功能/规则/用法（如 513 选股、指标策略、量能基线、基本面评分口径）"
-    "→ 先调用 search_project_docs 查项目文档与源码说明，以项目事实为回答基础；\n"
-    "   - 需要行情/报告数据（技术面/基本面/持仓/走势量能/新闻/盘面）→ 调用对应工具；"
-    "代码用 sh600519 这类形式，名称不确定时可用 search_project_docs 或 search_web 佐证；\n"
-    "   - 对个股或指数做全面分析时，优先调用 get_analysis_bundle，一次读取技术面、基本面、持仓报告、"
-    "单日盘面总结以及最近几日大盘/板块表现；不要只依据当天盘面总结；\n"
-    "2. 再按需叠加网络视角：在项目内容的基础上，若问题还涉及行业背景、市场观点、近期事件、"
-    "公司外部信息（护城河、批价、竞争格局），或需要外部信息验证/补充 → 再调用 search_web；"
-    "纯定义/用法类问题不必为搜而搜；\n"
-    "3. 事实与推断分开，证据与结论一一对应；先给基于**项目数据/规则**的结论与依据，再给**网络补充的外部视角**"
-    "（两部分分开表述，网络观点必须标注来源，且注明其不等于事实）；\n"
-    "专业术语必须就地用通俗中文解释：M20（20日均线）、ATR（近期正常波动幅度）、"
-    "量比（当前成交量相对常态）等，不只写缩写或公式；涉及做T价差时，把价差门槛换算成具体卖出价与接回价示例，"
-    "并说明ATR不是保证收益的硬性阈值，还要考虑交易成本和滑点。\n"
-    "4. 回答默认不超过500字；行情分析或操作问题按【结论】1~2句、【关键依据】3~5条、"
-    "【操作建议】、【风险与观察】组织；其他问题直接分点回答，不强行套用该结构；\n"
-    "5. 操作建议必须适配已持有或无持仓场景，写明触发条件、失效条件、仓位/风险控制和复查节点；"
-    "未给风险偏好时按审慎口径并注明前提；不要为了完整而强行给具体价位；深套持仓必须遵守项目深套策略，"
-    "不得把无持仓入场失效位直接套用于已有持仓，也不建议在破位低位直接割肉；"
-    "逻辑还在（逻辑未破坏）时优先给滚动做T方案：保留底仓，只用小仓在冲高减出，待回踩接回或重新站回支撑后接回，以降低持仓成本，"
-    "执行前确认价差、量能和支撑，且不承诺回本；若再创新低取消接回或补仓计划；"
-    "只有逻辑/基本面已破坏时，才等反弹到压力区分批离场；成本或浮亏未取到时，不判断是否深套，不给清仓建议；\n"
-    "6. 数据、检索或持仓信息未取到就明说未取到，数据矛盾时并列说明，绝不编造数字、新闻或事实；"
-    "买卖问题用条件式表述（若…则…），结尾固定附一行：以上基于公开数据与模型生成，不构成投资建议。\n"
+    "你是准确、克制、简洁的投资研究助手。先判断用户问题的类型和范围，不要默认问题是个股问题，"
+    "也不要为了显得完整而堆砌无关数据。\n"
+    "工具使用：只调用与问题直接相关的工具，够用即止；模型自行决定是否调用、调用哪个以及调用几次。\n"
+    "- 程序策略、指标、规则或用法问题：优先 search_project_docs；\n"
+    "- 通用概念或规则解释可直接回答，只有涉及时效性事实、行业现状或需要核验时才 search_web；\n"
+    "- 板块问题优先取板块和市场证据（get_market_summary，必要时 search_web），不要连带调用个股技术面或基本面；\n"
+    "- 只问个股某一维度时只取该维度：技术面用 get_technical_analysis/get_trend_volume，"
+    "基本面用 get_fundamentals_report，新闻用 get_recent_news；\n"
+    "- get_analysis_bundle 仅用于明确要求的个股/指数综合分析，不作为普通问答的默认入口；\n"
+    "- 组合或持仓问题才调用 get_portfolio_report。需要外部背景、近期事件或公司信息时再调用 search_web。\n"
+    "准确性：事实与推断分开，证据与结论一一对应；本地数据、网络来源和模型判断分开表述；"
+    "数据缺失、过期、可疑或数据矛盾时如实说明，绝不编造数字、新闻或事实。网络观点标注来源，且注明不等于事实。\n"
+    "回答方式：简单问题直接回答，不要机械套用固定模板；复杂个股、行情或操作问题才按【结论】、"
+    "【关键依据】、【操作建议】、【风险与观察】组织。回答默认不超过500字，宁可短而准确，不要啰嗦。\n"
+    "专业术语必须就地用通俗中文解释：M20（20日均线）、ATR（近期正常波动幅度）、量比（当前成交量相对常态）等。"
+    "涉及做T价差时，把价差门槛换算成具体卖出价与接回价示例，并说明ATR不是保证收益的硬性阈值，还要考虑交易成本和滑点。\n"
+    "涉及操作建议时适配已持有或无持仓场景，写明触发条件、失效条件、仓位/风险控制和复查节点；"
+    "不要为了完整而强行给具体价位。深套持仓遵守项目深套策略，不得把无持仓入场失效位直接套用于已有持仓，"
+    "也不建议在破位低位直接割肉；逻辑还在（逻辑未破坏）时优先给滚动做T方案：保留底仓，只用小仓在冲高减出，"
+    "待回踩接回或重新站回支撑后接回，以降低持仓成本；执行前确认价差、量能和支撑，且不承诺回本；"
+    "若再创新低取消接回或补仓计划；只有逻辑/基本面已破坏时，才等反弹到压力区分批离场；"
+    "成本或浮亏未取到时，不判断是否深套，不给清仓建议。\n"
+    "只在涉及具体买卖、仓位或持仓处置时附风险声明：以上基于公开数据与模型生成，不构成投资建议。"
     "最高优先级约束：盘中买卖、补仓、减仓、清仓和做T只服从本地动作守卫；"
     "未收到明确的actionable状态、行情交易日期、15/30分钟新鲜证据和T+1可卖量时，"
     "不得直接下达交易动作，只能写观察、风险事实、停止执行条件或下一交易日复核。"
@@ -1468,23 +1498,12 @@ def ask(
         hint = f"\n\n（辅助信息：问题里识别到标的 {resolved[1]}（{resolved[0]}），需要时可直接用该代码调用工具。）"
 
     collector: Dict[str, Any] = {"web_sources": []}
-    preloaded_bundle = ""
-    if resolved:
-        preloaded_bundle = dispatch(
-            "get_analysis_bundle",
-            {"code": resolved[0]},
-            project_dir=project_dir,
-            search_fn=search_fn,
-            collector=collector,
-        )
-        if preloaded_bundle and not preloaded_bundle.startswith("工具 "):
-            hint += "\n\n【综合报告素材（已预加载）】\n" + preloaded_bundle
 
     messages: List[Dict[str, Any]] = [
         {"role": "system", "content": QA_SYSTEM_PROMPT},
         {"role": "user", "content": text + hint},
     ]
-    used_tools: List[str] = ["get_analysis_bundle"] if preloaded_bundle else []
+    used_tools: List[str] = []
 
     for _ in range(max_rounds):
         message, finish_reason = _chat_request(

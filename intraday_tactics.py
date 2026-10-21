@@ -120,6 +120,48 @@ def _recent_has_data(recent_trend) -> bool:
     return any(_recent_value(recent_trend, key) is not None for key in keys)
 
 
+def _mapping_value(value, key, default=None):
+    if isinstance(value, Mapping):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _enum_value(value):
+    return getattr(value, "value", value)
+
+
+def _permission_allows(permissions, key):
+    if permissions is None:
+        return True
+    return bool(_mapping_value(permissions, key, False))
+
+
+def _opportunity_blocker(permissions, trend, high_position, intent):
+    major_trend = str(_enum_value(_mapping_value(trend, "major_trend", "")) or "")
+    if major_trend in {"DOWN", "大趋势向下"}:
+        return "大趋势向下，仅观察，不执行普通买入、接回或做T"
+
+    high_state = str(_enum_value(_mapping_value(high_position, "state", "")) or "").upper()
+    if high_state in {
+        "MISSING",
+        "HIGH_PENDING",
+        "DISTRIBUTION_RISK",
+        "SECOND_WAVE_CANDIDATE",
+    }:
+        return "高位结构未确认安全，仅观察，不执行普通买入、接回或做T"
+
+    permission_key = {
+        "buy": "allow_normal_buy",
+        "add": "allow_add",
+        "reentry": "allow_reentry",
+        "t": "allow_t",
+    }[intent]
+    if not _permission_allows(permissions, permission_key):
+        blockers = _mapping_value(permissions, "blockers", ()) or ()
+        return "；".join(blockers) or "趋势、市场或15/30分钟条件未同时通过，仅观察"
+    return None
+
+
 # ── 盘中策略引擎 ────────────────────────────────────────────────────────────
 
 class IntradayTactics:
@@ -212,6 +254,9 @@ class IntradayTactics:
         recent_trend=None,
         trend_weak: bool = False,
         price_location: str | None = None,
+        trade_permissions=None,
+        trend=None,
+        high_position=None,
     ) -> IntradaySignal | None:
         """判断当前行情是否触发信号（不关心跃迁/冷却）。
 
@@ -225,6 +270,7 @@ class IntradayTactics:
         broken_support / reclaimed_support 由调用方按当日行情维护。
         recent_trend 是近3/5个交易日的趋势、站稳M20天数和量能上下文。
         trend_weak / price_location 用于高位非深套的快速离场风险升级。
+        trade_permissions / trend / high_position 只限制普通机会，风险分支优先。
         """
         if price <= 0:
             return None
@@ -347,6 +393,16 @@ class IntradayTactics:
             and support > 0
             and support <= price <= support * (1 + PULLBACK_TOLERANCE)
         ):
+            blocker = _opportunity_blocker(
+                trade_permissions, trend, high_position, "reentry"
+            )
+            if blocker:
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} 站回支撑待确认",
+                    body=f"{blocker}；站回支撑仅记录为观察事实。",
+                    notification_body=blocker,
+                )
             if deep and red:
                 notification_body = (
                     f"支撑{support:.2f}｜不补仓；"
@@ -444,6 +500,37 @@ class IntradayTactics:
         # 回测（2022-07~2026-08，三个独立宇宙）显示突破信号跑输无条件买入，
         # 且放量阈值越高越差，故不提示买入仓位；M20 下行时更不可靠。
         if resistance > 0 and price > resistance and expanded:
+            major_trend = str(
+                _enum_value(_mapping_value(trend, "major_trend", "")) or ""
+            )
+            conflict = str(
+                _enum_value(_mapping_value(trend, "conflict", "")) or ""
+            )
+            if major_trend in {"DOWN", "大趋势向下"}:
+                label = (
+                    "下跌趋势中的反弹"
+                    if conflict in {"DOWN_MAJOR_REBOUND", "下跌趋势中的反弹"}
+                    else "下跌趋势中的反抽"
+                )
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} {label}",
+                    body=(
+                        f"现价{price:.2f}短时突破压力{resistance:.2f}，但大趋势向下，"
+                        f"只能识别为{label}；仅观察，不执行普通买入、接回或做T。"
+                    ),
+                    notification_body=f"{label}｜仅观察，不追涨",
+                )
+            blocker = _opportunity_blocker(
+                trade_permissions, trend, high_position, "buy"
+            )
+            if blocker and not holding:
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} 突破条件待确认",
+                    body=f"{blocker}；突破仅记录为观察事实，不执行买入。",
+                    notification_body=blocker,
+                )
             body = f"现价{price:.2f} 突破压力{resistance:.2f}，量比{volume_ratio:.1f}"
             if ma20_rising is False:
                 body += "；且 M20 仍在下行，突破可靠性不足"
@@ -473,6 +560,16 @@ class IntradayTactics:
             (change_pct >= t_threshold and (expanded or near_resistance))
             or (bias_far and expanded)
         ):
+            blocker = _opportunity_blocker(
+                trade_permissions, trend, high_position, "t"
+            )
+            if blocker and not leader_hold:
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} 做T条件待确认",
+                    body=f"{blocker}；冲高只记录为观察事实，不执行做T。",
+                    notification_body=blocker,
+                )
             # 板块龙头封板/强承接：跟风冲高延续概率更高，先于一切环境判断暂缓做T。
             # 龙头确认退潮、或当日再炸板，才会恢复（见 sector_leaders.LeaderGuard）。
             if leader_hold:
@@ -542,6 +639,16 @@ class IntradayTactics:
             and support > 0
             and support <= price <= support * (1 + PULLBACK_TOLERANCE)
         ):
+            blocker = _opportunity_blocker(
+                trade_permissions, trend, high_position, "reentry"
+            )
+            if blocker:
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} 回踩接回待确认",
+                    body=f"{blocker}；回踩只记录为观察事实，不执行接回。",
+                    notification_body=blocker,
+                )
             if recent_weak:
                 return None
             if _recent_has_data(recent_trend) and volume_ratio is not None and volume_ratio > 1.0:
@@ -565,6 +672,16 @@ class IntradayTactics:
             and support > 0
             and support <= price <= support * (1 + PULLBACK_TOLERANCE)
         ):
+            blocker = _opportunity_blocker(
+                trade_permissions, trend, high_position, "buy"
+            )
+            if blocker:
+                return IntradaySignal(
+                    signal_type=IntradaySignalType.TRADE_WAIT,
+                    title=f"🔎 {name} 回踩条件待确认",
+                    body=f"{blocker}；回踩只记录为观察事实，不执行买入。",
+                    notification_body=blocker,
+                )
             # M20 上下文可得时严格执行；不可得时退回旧口径
             if ma20_rising is False:
                 return None  # M20 下行：不提示买入

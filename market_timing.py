@@ -87,6 +87,7 @@ def format_market_timing_data(
     turnover_session: Optional[str] = None,
     turnover_source: Optional[str] = None,
     turnover_scope: Optional[str] = None,
+    market_cycle_text: Optional[str] = None,
 ) -> str:
     """格式化交给 AI 和持仓报告的市场时点、资金与量价证据。"""
     day = _as_date(date_value)
@@ -169,6 +170,8 @@ def format_market_timing_data(
         northbound_text,
         breadth_text,
     ]
+    if market_cycle_text:
+        lines.append(f"行情节奏：{market_cycle_text}")
     if metadata:
         lines.append("数据口径：" + "；".join(metadata))
     lines.append(

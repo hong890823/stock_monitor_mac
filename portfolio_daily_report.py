@@ -42,6 +42,8 @@ from market_evidence import (
     format_evidence_cards,
     summarize_t_filter_outcomes,
 )
+from continuation_hold_policy import format_continuation_hold_info
+from strong_continuation_policy import format_strong_risk
 from trade_action_guard import guard_actionable_copy
 
 # ── 口径常量 ──────────────────────────────────────────────
@@ -147,6 +149,11 @@ def _safe_float(value, default=0.0):
         return result
     except (TypeError, ValueError):
         return default
+
+
+def _positive_float(value) -> Optional[float]:
+    number = _safe_float(value, default=None)
+    return number if number is not None and math.isfinite(number) and number > 0 else None
 
 
 def _fmt_amount(value) -> str:
@@ -886,7 +893,7 @@ def build_overview(results, pnl, market) -> Dict[str, Any]:
         for field in (
             "status", "predicted_turnover_yi", "persistence_days",
             "persistence_average_yi", "industry_breadth", "concept_breadth",
-            "market_change_pct", "index_near_high",
+            "market_change_pct", "index_near_high", "activity_label",
         ):
             if not hasattr(market_quality, field):
                 continue
@@ -1488,6 +1495,46 @@ def _format_one_position(result, row) -> List[str]:
 
     vol = result.get("volatility") or {}
     pos = result.get("price_position") or {}
+    entry_info = result.get("entry_structure") or {}
+    trend = entry_info.get("trend_assessment") or {}
+    evidence = trend.get("evidence") or {}
+    high = entry_info.get("high_position") or {}
+    strong = entry_info.get("strong_continuation") or result.get("strong_continuation") or {}
+    hold = entry_info.get("continuation_hold") or result.get("continuation_hold") or {}
+    permissions = result.get("trade_permissions") or entry_info.get("trade_permissions") or {}
+    blockers = list(permissions.get("blockers") or [])
+    trend_parts = [
+        f"短期趋势：{trend.get('short_trend') or '数据不足'}｜"
+        f"大趋势：{trend.get('major_trend') or '数据不足'}｜"
+        f"趋势关系：{trend.get('conflict') or '数据不足'}｜"
+    ]
+    box_upper = _positive_float(evidence.get("box_upper"))
+    box_lower = _positive_float(evidence.get("box_lower"))
+    if box_upper is not None and box_lower is not None and box_upper > box_lower:
+        box_parts = []
+        box_state = str(evidence.get("box_state") or "")
+        if box_state not in {"", "箱体震荡", "非箱体", "箱体数据不足"}:
+            box_parts.append(f"箱体状态 {box_state}")
+        box_parts.extend([f"箱体上沿 {box_upper:.2f}", f"箱体下沿 {box_lower:.2f}"])
+        box_width = _positive_float(evidence.get("box_width_pct"))
+        if box_width is not None:
+            box_parts.append(f"区间 {box_width:.1f}%")
+        trend_parts.append("｜".join(box_parts) + "｜")
+    trend_parts.append(
+        f"高位结构：{high.get('state') or '数据不足'}｜"
+        f"限制：{'；'.join(blockers) if blockers else '无'}"
+    )
+    strong_risk = format_strong_risk(strong)
+    if strong_risk:
+        trend_parts.append(strong_risk + "｜")
+    if hold:
+        trend_parts.append(
+            f"持有策略：{hold.get('state_label') or hold.get('state') or '数据不足'}｜"
+            f"{format_continuation_hold_info(hold)}｜"
+        )
+    if entry_info.get("can_enter") or result.get("can_enter"):
+        trend_parts.append("日线就绪（非交易执行）｜")
+    out.append("".join(trend_parts))
     state_parts = [
         f"状态 {result.get('signal') or '—'}",
         f"评分 {_safe_float(result.get('score')):+.0f}",
@@ -1501,7 +1548,6 @@ def _format_one_position(result, row) -> List[str]:
     state_parts.append(f"现价 {_safe_float(result.get('price')):.2f}")
     state_parts.append(f"支撑 {support:.2f}" if support > 0 else "支撑 —")
     state_parts.append(f"压力 {resistance:.2f}" if resistance > 0 else "压力 —")
-    state_parts.append(f"失效 {_safe_float(stop):.2f}" if stop else "失效 —")
 
     tags = []
     age = result.get("data_age_days")
@@ -1607,10 +1653,10 @@ def _format_one_position(result, row) -> List[str]:
     action_parts = []
     if action_summary:
         action_parts.append(f"动作：{action_summary}")
+    action_parts.append(f"失效参考 {_safe_float(stop):.2f}" if stop else "失效参考 —")
     if notes:
         action_parts.append("今日：" + "；".join(notes[:2]))
-    if action_parts:
-        out.append("｜".join(action_parts))
+    out.append("｜".join(action_parts))
     return out
 
 

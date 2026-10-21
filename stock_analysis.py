@@ -8,12 +8,25 @@ from datetime import datetime
 import numpy as np
 import pandas as pd
 
+from continuation_hold_policy import (
+    ContinuationHoldInput,
+    assess_continuation_hold,
+    continuation_hold_to_dict,
+    format_continuation_hold_info,
+)
 from entry_structure import EntryInput, compute_entry_input, evaluate as evaluate_entry
+from high_position_policy import HighPositionInput, assess_high_position, high_position_to_dict
 from obv_divergence import evaluate as evaluate_obv_divergence
 from price_position import PriceLocation, PricePosition
 from volume_ratio import VolumeRatio, trading_minutes_elapsed
 from situation_notes import situation_notes
+from strong_continuation_policy import (
+    StrongContinuationInput,
+    assess_strong_continuation,
+    strong_continuation_to_dict,
+)
 from volume_price import VolumePrice, VolumePriceSignal, tag as vp_tag
+from trend_assessment import build_trade_permissions, trend_assessment_to_dict, assess_trend
 
 
 def _find_column(frame, names):
@@ -540,6 +553,87 @@ def analyze_history(history, code, name, live_data=None, benchmark_history=None)
             else None
         ),
     }
+    trend_result = assess_trend(
+        frame, price=price, now=datetime.now(), benchmark_ok=benchmark_above_ma20
+    )
+    high_result = assess_high_position(HighPositionInput(
+        price=price,
+        price_location=(price_position_info or {}).get("location_key", "MID"),
+        range_width_pct=(
+            ((price_position_info or {}).get("range_high", 0) - (price_position_info or {}).get("range_low", 0))
+            / max((price_position_info or {}).get("range_high", 1), 1) * 100
+        ) if price_position_info else None,
+        atr=atr_v,
+        volume_ratio=unified_volume_ratio,
+        close=price,
+        open=float(frame["open"].iloc[-1]) if len(frame) else None,
+        bar_position=(
+            (price - float(low.iloc[-1])) / max(float(high.iloc[-1]) - float(low.iloc[-1]), 1e-9)
+            if len(high) and len(low) else None
+        ),
+        upper_shadow_atr=(
+            (float(high.iloc[-1]) - price) / max(atr_v, 1e-9)
+            if len(high) and atr_v else None
+        ),
+        lower_pivots_rising=(
+            float(low.iloc[-1]) > float(low.iloc[-2])
+            if len(low) >= 2 else None
+        ),
+        support_holds=price >= recent20_low if recent20_low else None,
+        support=recent20_low,
+        resistance=recent20_high,
+        short_trend=trend_result.short_trend.value,
+        market_ok=benchmark_above_ma20,
+        sector_ok=None,
+        timeframe=None,
+    ))
+    permissions = build_trade_permissions(
+        trend_result, bool(entry.can_buy), high_result.state.value,
+        benchmark_above_ma20, None, None, "buy", 0, 0,
+    )
+    strong_result = assess_strong_continuation(StrongContinuationInput(
+        price=price,
+        ma5=ma5,
+        ma10=ma10,
+        ma20=ma20,
+        ma20_prev=entry_input.ma20_prev,
+        price_location=(price_position_info or {}).get("location_key", "MID"),
+        bias_pct=entry.bias_pct,
+        breakout_reference=prior_high,
+        volume_ratio=unified_volume_ratio,
+        lower_pivots_rising=(
+            float(low.iloc[-1]) > float(low.iloc[-2])
+            if len(low) >= 2 else None
+        ),
+        support_holds=price >= recent20_low if recent20_low else None,
+        market_ok=benchmark_above_ma20,
+        sector_ok=None,
+    ))
+    strong_info = strong_continuation_to_dict(strong_result)
+    hold_result = assess_continuation_hold(ContinuationHoldInput(
+        strong_state=strong_info["state"],
+        high_state=high_result.state.name,
+        risk_line=strong_info.get("risk_line"),
+        risk_price=strong_result.risk_price,
+        bias_pct=entry.bias_pct,
+        volume_ratio=unified_volume_ratio,
+        first_wave=entry.state.name in {"BREAKOUT", "PULLBACK_M20"},
+        timeframe_ok=None,
+    ))
+    hold_info = continuation_hold_to_dict(hold_result)
+    entry_info["trend_assessment"] = trend_assessment_to_dict(trend_result)
+    entry_info["high_position"] = high_position_to_dict(high_result)
+    entry_info["strong_continuation"] = strong_info
+    entry_info["continuation_hold"] = hold_info
+    entry_info["trade_permissions"] = {
+        "allow_normal_buy": permissions.allow_normal_buy,
+        "allow_add": permissions.allow_add,
+        "allow_reentry": permissions.allow_reentry,
+        "allow_t": permissions.allow_t,
+        "allow_probe": permissions.allow_probe,
+        "risk_only": permissions.risk_only,
+        "blockers": list(permissions.blockers),
+    }
     # 操作建议与入场结构对齐：结构优先于笼统的评分话术
     if entry.state.name != "NO_STRUCTURE" or entry.trend_weak:
         action = entry.action
@@ -619,6 +713,7 @@ def analyze_history(history, code, name, live_data=None, benchmark_history=None)
         "signals": signals,
         "action": action,
         "entry_structure": entry_info,
+        "continuation_hold": hold_info,
     }
 
 
@@ -747,6 +842,7 @@ def format_report(result):
         "benchmark_ok": None,
         "action": "暂以观察为主。",
     }
+    hold_info = result.get("continuation_hold") or entry_info.get("continuation_hold") or {}
 
     # 今日情境：把指标读数翻成「这只股现在发生了什么」。
     # 个股分析是「无持仓假设」，不传浮亏/深套口径。
@@ -767,6 +863,11 @@ def format_report(result):
         f"技术评分：{result['score']:+d}｜当前价：{_fmt_price(result['price'])}（{result['price_source']}）｜较前一日：{_fmt_pct(result['price_change'])}",
         f"今日情境：{situation_text}",
         f"入场结构：{entry_info['state_label']}",
+        (
+            f"持有策略：{hold_info.get('state_label') or hold_info.get('state')}｜"
+            f"{format_continuation_hold_info(hold_info)}"
+            if hold_info else "持有策略：证据不足"
+        ),
         f"操作建议（无持仓假设）：{result['action']}",
         "",
         "二、量价关系",

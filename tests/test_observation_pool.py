@@ -31,6 +31,22 @@ def _bars(end="2026-10-14", kind="pullback"):
     return bars
 
 
+def _high_break_bars(end="2026-10-14"):
+    bars = _bars(end, "neutral")
+    for index in range(len(bars) - 6, len(bars)):
+        progress = index - (len(bars) - 6)
+        close = 18.4 + progress * 0.35
+        bars[index].update(
+            open=close - 0.1,
+            high=close + 0.15,
+            low=close - 0.15,
+            close=close,
+            volume=100 + progress * 10,
+        )
+    bars[-1].update(open=19.1, high=19.15, low=18.85, close=19.0, volume=260)
+    return bars
+
+
 class ObservationPoolTests(unittest.TestCase):
     def review(self, pool, date="2026-10-14", kind="pullback", hits=None, benchmark=True):
         bars = _bars(date, kind)
@@ -45,15 +61,58 @@ class ObservationPoolTests(unittest.TestCase):
         self.assertEqual(pool.records["sh600001"]["status"], "observing")
         self.assertEqual(pool.records["sh600001"]["observation_days"], 0)
 
-    def test_entry_structure_promotes_without_repeating_original_screen_hit(self):
+    def test_entry_structure_stays_observing_until_strong_candidate(self):
         pool = ObservationPool()
         self.review(pool, "2026-10-13", hits=[_hit()])
         self.review(pool)
         record = pool.records["sh600001"]
         self.assertEqual(record["observation_days"], 2)
-        self.assertEqual(record["status"], "ready")
-        self.assertIn("回踩上行M20", record["reason"])
+        self.assertEqual(record["status"], "observing")
+        self.assertFalse(record["can_enter"])
+        self.assertIn("M20 上行", record["reason"])
+        self.assertIn("回踩", record["reason"])
         self.assertGreater(record["stop_price"], 0)
+
+    def test_daily_ready_does_not_require_intraday_permissions(self):
+        pool = ObservationPool()
+        self.review(pool, "2026-10-13", hits=[_hit("strong")])
+        self.review(pool)
+        record = pool.records["sh600001"]
+        self.assertEqual(record["status"], "ready")
+        self.assertTrue(record["can_enter"])
+        self.assertFalse(record["trade_permissions"]["allow_normal_buy"])
+        self.assertEqual(record["continuation_hold"]["state"], "HOLD_CONTINUATION")
+
+    def test_dynamic_risk_removes_sticky_normal_buy_permission(self):
+        pool = ObservationPool()
+        self.review(pool, "2026-10-13", hits=[_hit("strong")])
+        pool.records["sh600001"]["trade_permissions"]["allow_normal_buy"] = True
+        pool.review(
+            [],
+            datetime(2026, 10, 14, 18),
+            histories={"sh600001": _high_break_bars()},
+            benchmark=_bars("2026-10-14"),
+        )
+        self.assertFalse(
+            pool.records["sh600001"]["trade_permissions"]["allow_normal_buy"]
+        )
+
+    def test_high_bias_ma5_break_risk_downgrades_candidate(self):
+        pool = ObservationPool()
+        bars = _high_break_bars()
+        pool.review(
+            [_hit("strong")],
+            datetime(2026, 10, 14, 18),
+            histories={"sh600001": bars},
+            benchmark=_bars("2026-10-14"),
+        )
+        record = pool.records["sh600001"]
+        self.assertFalse(record["can_enter"])
+        self.assertEqual(record["strong_state"], "M5_BREAK_RISK")
+        self.assertEqual(record["risk_line"], "MA5")
+        self.assertGreater(record["risk_price"], record["price"])
+        self.assertIn("风险", record["reason"])
+        self.assertEqual(record["continuation_hold"]["state"], "BREAK_DEFENSE")
 
     def test_same_bar_on_weekend_and_same_day_does_not_count_twice(self):
         pool = ObservationPool()

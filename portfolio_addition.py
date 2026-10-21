@@ -60,6 +60,7 @@ class HoldingAssessmentInput:
     technical: Mapping[str, Any]
     fundamental: Optional[FundamentalSnapshot]
     missing: Tuple[str, ...] = ()
+    initial_entry_pct: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -398,6 +399,13 @@ def assess_holding(item: HoldingAssessmentInput, now: datetime) -> AdditionRecom
     missing = list(item.missing)
     reasons = []
     try:
+        trend_info = item.technical.get("trend_assessment") or {}
+        major_trend = str(trend_info.get("major_trend") or "")
+        high_info = item.technical.get("high_position") or {}
+        high_state = str(high_info.get("state") or "").upper()
+        permissions = item.technical.get("trade_permissions") or {}
+        major_down = major_trend in {"DOWN", "大趋势向下"}
+        bottoming = major_trend in {"BOTTOMING", "筑底阶段"}
         history = _valid_history(item.daily_history)
         history = history[history["date"] <= pd.Timestamp(now)]
         if len(history) < 250:
@@ -482,6 +490,48 @@ def assess_holding(item: HoldingAssessmentInput, now: datetime) -> AdditionRecom
             current_value=current_value,
             max_position_pct=item.max_position_pct,
         )
+        if major_down:
+            blockers.append("大趋势向下，禁止新增资金")
+            shares = 0
+        elif bottoming:
+            high_safe = high_state in {"", "NOT_HIGH", "非高位", "SECOND_WAVE_CONFIRMED", "二波确认"}
+            probe_allowed = bool(permissions.get("allow_probe", False)) and high_safe
+            if not probe_allowed:
+                blockers.append("筑底阶段只允许观察，暂不安排轻仓试错")
+                shares = 0
+            else:
+                cap_amount = float(permissions.get("probe_cap_amount") or 0.0)
+                if not math.isfinite(cap_amount) or cap_amount <= 0:
+                    cap_amount = (
+                        item.total_capital
+                        * max(0.0, float(item.initial_entry_pct or 0.0))
+                        / 100.0
+                        * 0.25
+                    )
+                cap_shares = int(cap_amount // item.price // LOT) * LOT if item.price > 0 else 0
+                available_shares = (
+                    int(item.available_capital // item.price // LOT) * LOT
+                    if item.price > 0 and item.available_capital > 0 else 0
+                )
+                shares = min(shares, cap_shares, available_shares)
+                reasons.append("筑底阶段仅安排不超过初始仓位金额25%的轻仓试错")
+        else:
+            high_blocked = high_state in {
+                "MISSING",
+                "数据不足",
+                "HIGH_PENDING",
+                "高位待定",
+                "DISTRIBUTION_RISK",
+                "高位派发风险",
+                "SECOND_WAVE_CANDIDATE",
+                "二波候选",
+            }
+            if high_blocked:
+                blockers.append(f"高位结构不允许新增资金：{high_state or '数据不足'}")
+                shares = 0
+            if not bool(permissions.get("allow_add", True)):
+                blockers.append("统一交易门控不允许新增资金")
+                shares = 0
         if composite_score < 70:
             blockers.append("综合分低于70")
         if technical_score < 65:
@@ -489,7 +539,7 @@ def assess_holding(item: HoldingAssessmentInput, now: datetime) -> AdditionRecom
         if shares < LOT:
             blockers.append("参考数量不足一手")
 
-        selected = not missing and not blockers
+        selected = not missing and not blockers and not bottoming and not major_down
         if selected:
             reasons.extend((
                 f"综合分{composite_score:.1f}",
@@ -518,8 +568,8 @@ def assess_holding(item: HoldingAssessmentInput, now: datetime) -> AdditionRecom
             yearly_score=yearly_score,
             monthly_score=monthly_score,
             weekly_score=weekly_score,
-            shares=shares if selected else 0,
-            amount=shares * item.price if selected else 0.0,
+            shares=shares if selected or bottoming else 0,
+            amount=shares * item.price if selected or bottoming else 0.0,
             stop_price=stop_price,
             position_pct_before=position_before,
             position_pct_after=position_after,

@@ -240,6 +240,55 @@ class MarketEvidenceTests(unittest.TestCase):
         self.assertEqual(17000.0, evidence["previous"])
         self.assertEqual("收盘后", evidence["session"])
 
+    def test_turnover_baseline_uses_only_prior_complete_close_days(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "_turnover_tracker.json"), "w", encoding="utf-8") as handle:
+                json.dump({
+                    "2026-10-08": {"0": 1200, "240": 18000},
+                    "2026-10-09": {"0": 1300, "240": 19000},
+                    "2026-10-12": {"0": 1200, "240": 20000},
+                    "2026-10-13": {"0": 1100, "240": 21000},
+                    "2026-10-14": {"0": 1000, "240": 22000},
+                    "2026-10-15": {"0": 1400, "60": 7000, "120": 12000},
+                }, handle)
+
+            history = ai_analysis._read_turnover_history(directory, "2026-10-15")
+
+        self.assertEqual(
+            history,
+            [
+                ("2026-10-08", 18000.0),
+                ("2026-10-09", 19000.0),
+                ("2026-10-12", 20000.0),
+                ("2026-10-13", 21000.0),
+                ("2026-10-14", 22000.0),
+            ],
+        )
+
+    def test_market_timing_context_rejects_short_intraday_contaminated_baseline(self):
+        import tempfile
+        import pandas as pd
+
+        with tempfile.TemporaryDirectory() as directory:
+            with open(os.path.join(directory, "_turnover_tracker.json"), "w", encoding="utf-8") as handle:
+                json.dump({
+                    "2026-10-09": {"0": 1300, "240": 19000},
+                    "2026-10-12": {"0": 1200, "240": 20000},
+                    "2026-10-13": {"0": 1100, "240": 21000},
+                    "2026-10-14": {"0": 1000, "220": 17000, "240": 22000},
+                    "2026-10-15": {"0": 1400, "220": 26000},
+                }, handle)
+            history = pd.DataFrame({
+                "date": ["2026-10-14", "2026-10-15"],
+                "close": [3200.0, 3250.0],
+            })
+            with mock.patch.object(ai_analysis, "fetch_history", return_value=history):
+                text = ai_analysis.load_market_timing_context(directory)
+
+        self.assertIn("完整收盘日不足5个", text)
+        self.assertNotIn("完整收盘日不足5个；历史基准可比较", text)
+
 
 class PromptTests(unittest.TestCase):
     def _context(self):
@@ -682,7 +731,7 @@ class AskAgentTests(unittest.TestCase):
         roles = [m.get("role") for m in second_payload["messages"]]
         self.assertIn("tool", roles)
 
-    def test_stock_question_preloads_all_four_reports(self):
+    def test_resolved_stock_question_does_not_preload_analysis_bundle(self):
         final_msg = {"role": "assistant", "content": "综合结论：先观察。"}
         bundle = (
             "【技术面数据】技术报告\n"
@@ -698,12 +747,33 @@ class AskAgentTests(unittest.TestCase):
 
         self.assertIn("综合结论：先观察。", report)
         user_content = post.call_args[1]["json"]["messages"][1]["content"]
-        self.assertIn("【技术面数据】技术报告", user_content)
-        self.assertIn("【基本面报告】基本面报告", user_content)
-        self.assertIn("【持仓报告】持仓报告", user_content)
-        self.assertIn("【市场环境（盘面总结缓存）】盘面总结", user_content)
-        dispatch_mock.assert_called_once()
-        self.assertEqual("get_analysis_bundle", dispatch_mock.call_args.args[0])
+        self.assertNotIn("【技术面数据】技术报告", user_content)
+        self.assertNotIn("综合报告素材（已预加载）", user_content)
+        dispatch_mock.assert_not_called()
+
+    def test_qa_prompt_routes_tools_by_question_scope(self):
+        final_msg = {"role": "assistant", "content": "板块目前分化，需看成交额和龙头扩散。"}
+        with mock.patch.object(ai_analysis, "load_config", return_value=self._config()), \
+                mock.patch("ai_analysis.requests.post", return_value=self._response(final_msg)) as post:
+            ask("只看半导体板块当前景气度，不用分析个股", project_dir=".")
+
+        system_content = post.call_args[1]["json"]["messages"][0]["content"]
+        self.assertIn("不要默认问题是个股问题", system_content)
+        self.assertIn("只调用与问题直接相关的工具", system_content)
+        self.assertIn("板块问题优先取板块和市场证据", system_content)
+        self.assertIn("get_analysis_bundle 仅用于明确要求的个股/指数综合分析", system_content)
+        self.assertIn("通用概念或规则解释可直接回答", system_content)
+
+    def test_qa_prompt_uses_flexible_concise_answer_shape(self):
+        final_msg = {"role": "assistant", "content": "简单回答。"}
+        with mock.patch.object(ai_analysis, "load_config", return_value=self._config()), \
+                mock.patch("ai_analysis.requests.post", return_value=self._response(final_msg)) as post:
+            ask("什么是市净率？", project_dir=".")
+
+        system_content = post.call_args[1]["json"]["messages"][0]["content"]
+        self.assertIn("简单问题直接回答", system_content)
+        self.assertIn("不要机械套用固定模板", system_content)
+        self.assertIn("只在涉及具体买卖、仓位或持仓处置时附风险声明", system_content)
 
     def test_agent_tools_schema_is_sent(self):
         final_msg = {"role": "assistant", "content": "好的"}

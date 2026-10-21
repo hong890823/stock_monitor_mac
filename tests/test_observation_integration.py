@@ -11,7 +11,7 @@ import pandas as pd
 from five_one_three import FiveOneThreeStage
 from observation_pool import ObservationPool
 from stock_menubar import StockMenuBar
-from tests.test_observation_pool import _bars, _hit
+from tests.test_observation_pool import _bars, _high_break_bars, _hit
 
 
 class ObservationIntegrationTests(unittest.TestCase):
@@ -46,6 +46,88 @@ class ObservationIntegrationTests(unittest.TestCase):
             },
         )
 
+    def test_strong_hit_keeps_risk_context(self):
+        hits = StockMenuBar._observation_hits(
+            strict=[], relaxed=[], five=[],
+            strong=[{
+                "code": "sz000001",
+                "name": "强势股",
+                "price": 10.0,
+                "strong_state": "STRONG_CONTINUATION",
+                "risk_line": "MA20",
+                "risk_price": 9.6,
+                "continuation_state": "HOLD_CONTINUATION",
+                "continuation_hold": {"state": "HOLD_CONTINUATION"},
+            }],
+        )
+        self.assertEqual(hits[0]["source"], "strong")
+        self.assertEqual(hits[0]["strong_state"], "STRONG_CONTINUATION")
+        self.assertEqual(hits[0]["risk_line"], "MA20")
+        self.assertEqual(hits[0]["risk_price"], 9.6)
+        self.assertEqual(hits[0]["continuation_state"], "HOLD_CONTINUATION")
+        self.assertEqual(hits[0]["continuation_hold"]["state"], "HOLD_CONTINUATION")
+
+    def test_daily_strong_candidate_keeps_eligibility_and_risk_line(self):
+        candidate = StockMenuBar._strong_candidate_from_bars(
+            "sz000001", "强势股", _bars(),
+        )
+        self.assertEqual(candidate["strong_state"], "STRONG_CONTINUATION")
+        self.assertTrue(candidate["eligible_candidate"])
+        self.assertEqual(candidate["risk_line"], "MA20")
+        self.assertEqual(candidate["continuation_hold"]["state"], "HOLD_CONTINUATION")
+
+    def test_dynamic_break_stock_is_not_returned_as_strong_candidate(self):
+        candidate = StockMenuBar._strong_candidate_from_bars(
+            "sz000001", "高位股", _high_break_bars(),
+        )
+        self.assertIsNone(candidate)
+
+    def test_extended_stock_is_observation_only(self):
+        bars = _high_break_bars()
+        bars[-1].update(open=20.0, high=20.4, low=19.9, close=20.3, volume=120)
+        candidate = StockMenuBar._strong_candidate_from_bars(
+            "sz000001", "高位股", bars,
+        )
+        self.assertEqual(candidate["strong_state"], "EXTENDED_CONTINUATION")
+        self.assertFalse(candidate["eligible_candidate"])
+        self.assertEqual(candidate["continuation_hold"]["state"], "PROFIT_PROTECTION")
+
+    def test_strong_candidates_survive_screen_state_reload(self):
+        with TemporaryDirectory() as directory:
+            app = self.app(directory)
+            app.screen_results_state_file = str(Path(directory) / "screen.json")
+            app.indicator_data = []
+            app.relaxed_indicator_data = []
+            app.strong_candidate_data = []
+            app.five_one_three_data = []
+            app.five_one_three_stats = {}
+            app._indicator_group_at = None
+            app._pattern_group_at = None
+            app.indicator_results_stale = False
+            app.indicator_results_stale_at = None
+            strong = [{
+                "code": "sh600001",
+                "name": "强势股",
+                "price": 10.0,
+                "strong_state": "STRONG_CONTINUATION",
+                "risk_line": "MA20",
+                "risk_price": 9.6,
+            }]
+            app._merge_screen_results(
+                strict=[], relaxed=[], strong=strong, five=[], stats={},
+                include_patterns=False, completed_at=datetime.now(),
+            )
+
+            restored = self.app(directory)
+            restored.screen_results_state_file = app.screen_results_state_file
+            restored.indicator_data = []
+            restored.relaxed_indicator_data = []
+            restored.strong_candidate_data = []
+            restored.five_one_three_data = []
+            restored.five_one_three_stats = {}
+            restored._load_screen_results()
+            self.assertEqual(restored.strong_candidate_data, strong)
+
     def test_existing_candidate_is_reviewed_even_without_new_screen_hits(self):
         with TemporaryDirectory() as directory:
             app = self.app(directory)
@@ -56,9 +138,26 @@ class ObservationIntegrationTests(unittest.TestCase):
                  patch.object(app, "get_stock_data", return_value={"name": "测试股份"}):
                 app._refresh_observation_pool([], datetime(2026, 10, 14, 18))
             record = app.observation_pool.records["sh600001"]
-            self.assertEqual(record["status"], "ready")
+            self.assertEqual(record["status"], "observing")
+            self.assertFalse(record["can_enter"])
             self.assertEqual(record["last_reviewed_date"], "2026-10-14")
             self.assertIn("日线候选", (Path(directory) / "_screen_observation.txt").read_text())
+
+    def test_observation_history_requests_include_long_trend_window(self):
+        with TemporaryDirectory() as directory:
+            app = self.app(directory)
+            calls = []
+
+            def history(code, data_length=240):
+                calls.append((code, data_length))
+                return pd.DataFrame(_bars())
+
+            with patch.object(app, "get_stock_analysis_history", side_effect=history), \
+                 patch.object(app, "get_stock_data", return_value={"name": "测试股份"}):
+                app._refresh_observation_pool([_hit()], datetime(2026, 10, 14, 18))
+
+            self.assertTrue(calls)
+            self.assertEqual({length for _, length in calls}, {400})
 
     def test_review_failure_retains_candidate_and_schedules_retry(self):
         with TemporaryDirectory() as directory:

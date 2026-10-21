@@ -80,6 +80,10 @@ def guard_actionable_copy(
     if kind in {"buy", "add"}:
         if not _valid_trade_date(trade_date):
             return GuardedCopy("observation", "仅观察：行情日期未确认，不执行买入或补仓。", reason="缺少行情日期")
+        if "仅观察" in text and any(
+            marker in text for marker in ("趋势", "高位", "市场", "板块", "15/30")
+        ):
+            return GuardedCopy("observation", text, reason="交易门控限制")
         if (
             not _evidence_value(evidence, "complete")
             or _evidence_value(evidence, "m15_confirmations", 0) < 2

@@ -77,7 +77,15 @@ class FakeStockMenuBar:
 class PortfolioAdditionServiceTests(unittest.TestCase):
     def test_prepare_inputs_fetches_missing_fundamentals_and_filters_watchlist(self):
         technical = {
-            "sh600001": {"price": 12.5, "entry_can_buy": True},
+            "sh600001": {
+                "price": 12.5,
+                "entry_can_buy": True,
+                "entry_structure": {
+                    "trend_assessment": {"major_trend": "筑底阶段"},
+                    "high_position": {"state": "非高位"},
+                    "trade_permissions": {"allow_probe": True},
+                },
+            },
             "sh600002": {"price": 20.0},
         }
         history = pd.DataFrame([{
@@ -118,6 +126,7 @@ class PortfolioAdditionServiceTests(unittest.TestCase):
                 "total_capital": 200000,
                 "available_capital": 50000,
                 "max_position_pct": 20,
+                "initial_entry_pct": 7,
                 "positions": [
                     {"code": "sh600001", "name": "甲", "quantity": 1000, "cost": 10},
                     {"code": "sh600002", "name": "观察", "quantity": 0, "cost": 0},
@@ -128,6 +137,11 @@ class PortfolioAdditionServiceTests(unittest.TestCase):
             self.assertEqual(inputs[0].fundamental.health_level, "SOUND")
             self.assertEqual(inputs[0].fundamental.quarter_trends, ((10.0, 12.0),))
             self.assertEqual(inputs[0].missing, ())
+            self.assertEqual(inputs[0].initial_entry_pct, 7.0)
+            self.assertEqual(
+                inputs[0].technical.get("trend_assessment", {}).get("major_trend"),
+                "筑底阶段",
+            )
             history_fetcher.assert_called_once_with("sh600001", data_length=1250)
             fundamentals_fetcher.assert_called_once_with("sh600001", "甲")
 
