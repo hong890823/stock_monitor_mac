@@ -376,7 +376,7 @@ class TurnoverTracker:
         if before_date:
             dates = [date for date in dates if date < before_date]
         values: List[Tuple[str, float]] = []
-        for date in dates[-max(1, limit):]:
+        for date in reversed(dates):
             samples = self._data.get(date) or {}
             value = samples.get(self._CLOSE_SAMPLE_KEY)
             try:
@@ -385,7 +385,9 @@ class TurnoverTracker:
                 continue
             if number > 0:
                 values.append((date, number))
-        return values
+                if len(values) >= max(1, limit):
+                    break
+        return list(reversed(values))
 
     # ------------------------------------------------------------------
     # 核心采样

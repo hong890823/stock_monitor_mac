@@ -158,17 +158,6 @@ def _turnover_context(
     valid_values = [value for _, value in records]
     sample_count = len(valid_values)
     baseline = median(valid_values) if valid_values else None
-    ratio = (
-        turnover / baseline
-        if (
-            turnover is not None
-            and turnover > 0
-            and baseline is not None
-            and baseline > 0
-            and sample_count >= 5
-        )
-        else None
-    )
     dated_records = [(day, value) for day, value in records if day]
     latest_date = dated_records[-1][0] if dated_records else None
     gap_count = 0
@@ -185,6 +174,19 @@ def _turnover_context(
         and (date.fromisoformat(as_of) - date.fromisoformat(latest_date)).days > 7
     )
     ready = sample_count >= 5
+    dates_complete = len(dated_records) == sample_count
+    comparable = ready and dates_complete and not stale and gap_count == 0
+    ratio = (
+        turnover / baseline
+        if (
+            turnover is not None
+            and turnover > 0
+            and baseline is not None
+            and baseline > 0
+            and comparable
+        )
+        else None
+    )
     return ratio, baseline, sample_count, latest_date, gap_count, stale, ready
 
 

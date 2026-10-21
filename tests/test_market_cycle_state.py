@@ -75,6 +75,30 @@ class MarketCycleStateTests(unittest.TestCase):
             self.assertEqual(payload["phase"], "DOWN")
             self.assertEqual(payload["last_advanced_date"], "2026-10-14")
 
+    def test_unknown_evidence_does_not_reset_existing_phase(self):
+        store = MarketCycleStateStore(":memory:")
+        store.observe(
+            MarketCyclePhase.UP, "2026-10-14", finalized=True,
+            evidence=("指数上涨",),
+        )
+
+        result = store.observe(
+            MarketCyclePhase.UNKNOWN, "2026-10-15", finalized=True,
+            evidence=("指数数据暂缺",),
+        )
+
+        self.assertEqual(result.phase, MarketCyclePhase.UP)
+        self.assertEqual(result.phase_age_days, 1)
+        self.assertEqual(result.last_evidence, ("指数数据暂缺",))
+
+    def test_same_phase_age_advances_by_weekdays_across_report_gap(self):
+        store = MarketCycleStateStore(":memory:")
+        store.observe(MarketCyclePhase.UP, "2026-10-14", finalized=True)
+
+        result = store.observe(MarketCyclePhase.UP, "2026-10-21", finalized=True)
+
+        self.assertEqual(result.phase_age_days, 6)
+
 
 if __name__ == "__main__":
     unittest.main()

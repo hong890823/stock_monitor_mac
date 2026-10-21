@@ -21,6 +21,21 @@ def _date_text(value: object) -> str:
         raise ValueError("行情日期必须是YYYY-MM-DD") from error
 
 
+def _business_days_between(start_text: str, end_text: str) -> int:
+    start = date.fromisoformat(start_text)
+    end = date.fromisoformat(end_text)
+    if end <= start:
+        return 0
+    current = start.toordinal() + 1
+    end_ordinal = end.toordinal()
+    count = 0
+    while current <= end_ordinal:
+        if date.fromordinal(current).weekday() < 5:
+            count += 1
+        current += 1
+    return count
+
+
 @dataclass(frozen=True)
 class MarketCycleState:
     phase: MarketCyclePhase
@@ -54,6 +69,30 @@ class MarketCycleStateStore:
         quote_day = _date_text(quote_date)
         clean_evidence = tuple(str(item) for item in evidence if str(item).strip())
         current = self._state
+
+        if phase is MarketCyclePhase.UNKNOWN:
+            if current is None:
+                current = self._new_state(
+                    phase,
+                    quote_day,
+                    age=0,
+                    advanced_date=None,
+                    evidence=clean_evidence,
+                )
+            else:
+                current = MarketCycleState(
+                    phase=current.phase,
+                    phase_start_date=current.phase_start_date,
+                    phase_age_days=current.phase_age_days,
+                    divergence_age_days=current.divergence_age_days,
+                    down_age_days=current.down_age_days,
+                    last_advanced_date=current.last_advanced_date,
+                    last_evidence=clean_evidence or current.last_evidence,
+                    phase_switch_evidence=current.phase_switch_evidence,
+                )
+            self._state = current
+            self._save()
+            return current
 
         if current is None:
             if finalized:
@@ -94,7 +133,11 @@ class MarketCycleStateStore:
                 last_evidence=clean_evidence or current.last_evidence,
                 phase_switch_evidence=current.phase_switch_evidence,
             )
-        elif current.last_advanced_date is None and quote_day == current.phase_start_date:
+        elif (
+            current.phase is not MarketCyclePhase.UNKNOWN
+            and current.last_advanced_date is None
+            and quote_day == current.phase_start_date
+        ):
             current = self._new_state(
                 current.phase,
                 quote_day,
@@ -104,13 +147,27 @@ class MarketCycleStateStore:
                 switch_evidence=current.phase_switch_evidence,
             )
         elif current.phase == phase:
-            age = (current.phase_age_days or 0) + 1
+            if current.last_advanced_date:
+                elapsed_days = _business_days_between(
+                    current.last_advanced_date,
+                    quote_day,
+                )
+                age = (current.phase_age_days or 0) + max(1, elapsed_days)
+            else:
+                age = (current.phase_age_days or 0) + 1
+            evidence = clean_evidence or current.last_evidence
+            if current.last_advanced_date and (
+                date.fromisoformat(quote_day) - date.fromisoformat(current.last_advanced_date)
+            ).days > 4:
+                evidence = tuple(evidence) + (
+                    "阶段日期跨度较大，年龄按工作日近似推进",
+                )
             current = self._new_state(
                 phase,
                 current.phase_start_date or quote_day,
                 age=age,
                 advanced_date=quote_day,
-                evidence=clean_evidence or current.last_evidence,
+                evidence=evidence,
                 switch_evidence=current.phase_switch_evidence,
             )
         else:

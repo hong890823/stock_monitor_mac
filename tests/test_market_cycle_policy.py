@@ -127,6 +127,7 @@ class MarketCyclePolicyTests(unittest.TestCase):
         self.assertEqual(result.confidence, "低")
         self.assertTrue(any("历史基准过旧" in reason for reason in result.reasons))
         self.assertTrue(any("日期缺口" in reason for reason in result.reasons))
+        self.assertIsNone(result.turnover_ratio)
 
     def test_high_turnover_divergence_uses_structure_to_adjust_window(self):
         result = assess_market_cycle(MarketCycleInput(
