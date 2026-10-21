@@ -16,7 +16,12 @@ from fundamental_health import tendency as health_tendency
 from intraday_tactics import IntradayTactics, limit_pct_for_board
 from intraday_trade_policy import PositionEligibility
 from situation_notes import situation_notes
-from trade_action_guard import guard_actionable_copy, guard_intraday_signal
+from trade_action_guard import (
+    allows_exit_directive,
+    guard_actionable_copy,
+    guard_intraday_signal,
+    position_cost_share,
+)
 from volume_price import VolumePrice, tag as vp_tag
 
 
@@ -121,6 +126,14 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
         and str(price_location or "").upper() == "HIGH"
         and trend_weak
     )
+    # 直接撤出话术的门槛：基本面亮红灯 / 价格处高位 / 仓位不小，三者占一。
+    # 基本面未见恶化 + 价格不高 + 仓位小的持仓只提示风险事实（2026-10-22
+    # 招商证券：基本面好、位置低位、小仓位却被「不保留确定观察仓」直接劝退）。
+    fundamental_level = getattr(fundamental_health, "level", None)
+    position_share_pct = position_cost_share(portfolio, quantity, cost)
+    exit_directive_ok = allows_exit_directive(
+        fundamental_level, price_location, position_share_pct,
+    )
 
     # ── 盘中买卖点信号检测 ──
     intraday_signal = _tactics.check_signal(
@@ -224,15 +237,15 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
             )
         elif continuation_hold.get("state") in {"BREAK_DEFENSE", "DISTRIBUTION_RISK"}:
             signal = "减仓风险"
-            action = format_continuation_hold_info(continuation_hold)
+            action = format_continuation_hold_info(continuation_hold, exit_directive_ok)
         elif continuation_hold.get("state") == "PROFIT_PROTECTION":
             signal = "持有/止盈观察"
-            action = format_continuation_hold_info(continuation_hold)
+            action = format_continuation_hold_info(continuation_hold, exit_directive_ok)
         elif continuation_hold.get("state") in {
             "HOLD_CONTINUATION", "SECOND_WAVE_WATCH", "SECOND_WAVE_CONFIRMED",
         }:
             signal = "持有观察"
-            action = format_continuation_hold_info(continuation_hold)
+            action = format_continuation_hold_info(continuation_hold, exit_directive_ok)
         elif trend_weak:
             signal = "趋势转弱观察"
             action = (
@@ -340,6 +353,11 @@ def evaluate_position(position, technical, live_data, portfolio, fundamental_hea
         "price_change": change_pct,
         "trade_date": str(live_data.get("date") or "")[:10] or None,
         "atr": technical.get("atr"),
+        # 直接撤出话术门槛的上下文（trade_action_guard.allows_exit_directive）：
+        # 基本面/价格位置/仓位三者占一才允许「清仓离场、不保留观察仓」类话术。
+        "fundamental_level": fundamental_level,
+        "position_share_pct": position_share_pct,
+        "exit_directive_ok": exit_directive_ok,
         # 数据日期如实透传：日线停在远古（停牌/退市/数据源给错）时，
         # 下面的技术位全是旧的，报告必须说出来而不是当今天的分析卖。
         "data_as_of": technical.get("data_as_of"),

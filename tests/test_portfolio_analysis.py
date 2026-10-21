@@ -191,6 +191,71 @@ class TestBreakActions(unittest.TestCase):
         self.assertIn("基本面暂无数据", result["action"])
 
 
+class TestExitDirectiveGate(unittest.TestCase):
+    """2026-10-22 招商证券：基本面好、位置低位、小仓位，盘中被「不保留确定观察仓」
+    直接劝退。基本面非红灯 + 价格不高 + 仓位小 → 只提示风险事实，不喊撤出。"""
+
+    @staticmethod
+    def _portfolio_with_positions():
+        return {
+            "total_capital": 400_000,
+            "available_capital": 100_000,
+            "initial_entry_pct": 5,
+            "max_position_pct": 20,
+            "positions": [
+                {"code": "sh600999", "name": "招商证券", "quantity": 1200, "cost": 16.23},
+                {"code": "sh600001", "name": "大盘股", "quantity": 5000, "cost": 40.0},
+            ],
+        }
+
+    def _evaluate_zhaoshang(self, health=None, price_location="LOW",
+                            continuation_hold=None):
+        # price 站在支撑上方：让持有策略分支（而非破位分支）出文案，
+        # 正是报告「持有策略：派发风险…不保留确定观察仓」那条链路。
+        return evaluate_position(
+            position={"code": "sh600999", "name": "招商证券",
+                      "quantity": 1200, "cost": 16.23},
+            technical=_technical(
+                price=16.5, support=16.08,
+                price_location=price_location,
+                continuation_hold=continuation_hold or {
+                    "state": "DISTRIBUTION_RISK",
+                    "state_label": "派发风险",
+                    "keep_observation_position": False,
+                    "can_trim": False,
+                },
+            ),
+            live_data={},
+            portfolio=self._portfolio_with_positions(),
+            fundamental_health=health,
+        )
+
+    def test_light_low_position_gets_no_exit_directive(self):
+        result = self._evaluate_zhaoshang(health=_Health(level="SOUND"))
+        self.assertFalse(result["exit_directive_ok"])
+        self.assertNotIn("不保留确定观察仓", result["action"])
+        self.assertIn("仅提示风险事实", result["action"])
+        self.assertIn("不必直接撤出", result["action"])
+
+    def test_missing_fundamentals_still_no_exit_directive(self):
+        # 基本面没数据不等于可以喊撤出——缺证据不喊撤出。
+        result = self._evaluate_zhaoshang(health=None)
+        self.assertFalse(result["exit_directive_ok"])
+        self.assertNotIn("不保留确定观察仓", result["action"])
+
+    def test_red_fundamentals_keep_exit_directive(self):
+        result = self._evaluate_zhaoshang(health=_Health(level="ALERT"))
+        self.assertTrue(result["exit_directive_ok"])
+        self.assertIn("不保留确定观察仓", result["action"])
+
+    def test_high_price_keeps_exit_directive(self):
+        result = self._evaluate_zhaoshang(
+            health=_Health(level="SOUND"), price_location="HIGH",
+        )
+        self.assertTrue(result["exit_directive_ok"])
+        self.assertIn("不保留确定观察仓", result["action"])
+
+
 class TestPassthroughFields(unittest.TestCase):
     """2026-10-12：result 缺 atr / benchmark_ok / price_change，下游只能空读。
 

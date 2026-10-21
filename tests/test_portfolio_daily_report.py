@@ -32,6 +32,7 @@ from portfolio_daily_report import (
     format_portfolio_advice_section,
     format_t_filter_events,
     format_menu_summary,
+    format_news_impact_section,
     is_deep,
     menu_title,
     portfolio_fingerprint,
@@ -481,6 +482,76 @@ class OverviewTests(unittest.TestCase):
         self.assertIn("平台口径主力净流出", text)
 
 
+class NewsImpactSectionTests(unittest.TestCase):
+    """「七、近两日利好/利空」：只显示有真利好/真利空的个股。"""
+
+    @staticmethod
+    def _impact(**kwargs):
+        base = {
+            "code": "sh600522", "name": "中天科技",
+            "direction": "无", "note": "", "evidence": [], "ai": True,
+        }
+        base.update(kwargs)
+        return base
+
+    def test_only_qualifying_stocks_are_listed(self):
+        lines = format_news_impact_section([
+            self._impact(),
+            self._impact(
+                code="sh600999", name="招商证券", direction="利空",
+                note="股东减持，短期供给增加",
+                evidence=[{"source": "公告", "date": "2026-10-21", "title": "减持计划公告"}],
+            ),
+        ])
+        text = "\n".join(lines)
+        self.assertIn("七、近两日利好/利空", text)
+        self.assertIn("利空 招商证券：股东减持，短期供给增加", text)
+        self.assertNotIn("中天科技", text)
+        self.assertIn("公告 2026-10-21「减持计划公告」", text)
+        self.assertIn("DeepSeek 判定", text)
+
+    def test_all_none_reports_a_single_line(self):
+        lines = format_news_impact_section([self._impact(), self._impact(code="x")])
+        text = "\n".join(lines)
+        self.assertIn("近两日无明确利好/利空事项。", text)
+        self.assertNotIn("中天科技", text)
+
+    def test_degraded_fallback_marks_keyword_scope(self):
+        lines = format_news_impact_section([
+            self._impact(direction="利空", ai=False, note="公告口径判定为利空"),
+        ])
+        self.assertIn("公司公告关键词判定", "\n".join(lines))
+
+    def test_negative_sorts_before_positive(self):
+        lines = format_news_impact_section([
+            self._impact(code="a", name="甲", direction="利好"),
+            self._impact(code="b", name="乙", direction="利空"),
+        ])
+        self.assertLess(
+            "\n".join(lines).index("利空 乙"),
+            "\n".join(lines).index("利好 甲"),
+        )
+
+    def test_report_without_impact_omits_section(self):
+        pnl = compute_pnl([], {})
+        overview = build_overview([], pnl, {})
+        text = format_daily_report(overview, [], pnl, {"generated_at": "10:02"})
+        self.assertNotIn("七、近两日利好/利空", text)
+
+    def test_report_with_impact_appends_section_after_detail(self):
+        pnl = compute_pnl([], {})
+        overview = build_overview([], pnl, {})
+        text = format_daily_report(
+            overview, [], pnl, {"generated_at": "10:02"},
+            news_impact=[self._impact(direction="利好", note="回购护盘")],
+        )
+        self.assertIn("七、近两日利好/利空", text)
+        self.assertIn("利好 中天科技：回购护盘", text)
+        # 章节在逐股明细之后、口径脚注之前
+        self.assertLess(text.index("六、逐股明细"), text.index("七、近两日利好/利空"))
+        self.assertLess(text.index("七、近两日利好/利空"), text.index("口径：今日盈亏"))
+
+
 class PortfolioAdviceTests(unittest.TestCase):
     def test_high_risk_portfolio_recommends_reducing_total_exposure(self):
         text = "\n".join(format_portfolio_advice_section({
@@ -690,6 +761,28 @@ class CompactPositionDetailTests(unittest.TestCase):
         text = "\n".join(_format_one_position(res, {"today": -120, "pct": -3.0}))
         self.assertIn("持有策略：持有延续", text)
         self.assertIn("保留观察仓", text)
+
+    def test_hold_strategy_exit_copy_follows_exit_directive_flag(self):
+        # 2026-10-22 招商证券：持有策略行原样输出「不保留确定观察仓」劝退。
+        # exit_directive_ok=False（基本面非红灯+价低+仓小）时必须降级为风险事实。
+        res = result()
+        res["exit_directive_ok"] = False
+        res["continuation_hold"] = {
+            "state": "DISTRIBUTION_RISK",
+            "state_label": "派发风险",
+            "keep_observation_position": False,
+        }
+        res["entry_structure"] = {
+            "trend_assessment": {
+                "short_trend": "近期向下",
+                "major_trend": "大趋势向下",
+                "conflict": "长短趋势同步向下",
+            },
+            "high_position": {"state": "非高位"},
+        }
+        text = "\n".join(_format_one_position(res, {"today": -120, "pct": -3.0}))
+        self.assertNotIn("不保留确定观察仓", text)
+        self.assertIn("仅提示风险事实", text)
 
     def test_strong_risk_shows_daily_ready_without_trade_execution(self):
         res = result()

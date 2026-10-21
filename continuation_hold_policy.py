@@ -147,7 +147,9 @@ def assess_continuation_hold(value: ContinuationHoldInput) -> ContinuationHoldAs
     )
 
 
-def format_continuation_hold(value: ContinuationHoldAssessment) -> str:
+def format_continuation_hold(
+    value: ContinuationHoldAssessment, exit_directive_ok: bool = True,
+) -> str:
     if value.state is ContinuationHoldState.HOLD_CONTINUATION:
         return "持有延续：结构未失效，保留观察仓；不因短期盈利退出。"
     if value.state is ContinuationHoldState.PROFIT_PROTECTION:
@@ -160,6 +162,13 @@ def format_continuation_hold(value: ContinuationHoldAssessment) -> str:
         reference = f"，风险参考 {value.risk_price:.2f}" if value.risk_price is not None else ""
         return f"破位防守：结构失效优先于盈利兑现{reference}。"
     if value.state is ContinuationHoldState.DISTRIBUTION_RISK:
+        if not exit_directive_ok:
+            # 基本面未亮红灯 + 价格不高 + 仓位小：只报风险事实，不喊撤出
+            # （2026-10-22 招商证券被「不保留确定观察仓」直接劝退）。
+            return (
+                "派发风险：出现下杀或承接转弱证据，仅提示风险事实；"
+                "基本面未亮红灯、价格不高、仓位轻，不必直接撤出，等盘中确认再定。"
+            )
         return "派发风险：出现下杀或承接转弱证据，优先风险处置，不保留确定观察仓。"
     return "证据不足：只观察，不输出持有延续、部分兑现或二波结论。"
 
@@ -189,5 +198,5 @@ def continuation_hold_from_dict(value: dict) -> ContinuationHoldAssessment:
     )
 
 
-def format_continuation_hold_info(value: dict) -> str:
-    return format_continuation_hold(continuation_hold_from_dict(value))
+def format_continuation_hold_info(value: dict, exit_directive_ok: bool = True) -> str:
+    return format_continuation_hold(continuation_hold_from_dict(value), exit_directive_ok)

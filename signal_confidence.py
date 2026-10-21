@@ -167,6 +167,8 @@ class SignalConfidence:
         confidence = self.calculate_confidence(
             code, signal_type, current_price, current_conditions
         )
+        if confidence < CONFIDENCE_THRESHOLD:
+            return 0
 
         # 根据置信度映射到确认轮数
         for threshold, rounds in CONFIDENCE_TO_ROUNDS:
@@ -294,24 +296,18 @@ class SignalConfidence:
             if r.signal_type == signal_type.value and r.price_after_5m is not None
         ]
 
-        if not type_records:
+        direction = signal_success_direction(signal_type)
+        if direction is None or not type_records:
             return 0.5
 
-        # 计算成功率（信号后5分钟价格变化方向与信号一致）
-        success_count = 0
-        for record in type_records:
-            if signal_type in [
-                IntradaySignalType.BREAKOUT,
-                IntradaySignalType.T_SELL,
-                IntradaySignalType.T_HOLD_LEADER,
-            ]:
-                # 买入/卖出信号：价格上涨为成功
-                if record.price_after_5m > record.trigger_price:
-                    success_count += 1
-            elif signal_type in [IntradaySignalType.BREAK_SUPPORT, IntradaySignalType.T_BUY, IntradaySignalType.PULLBACK]:
-                # 卖出/买入信号：价格下跌为成功
-                if record.price_after_5m < record.trigger_price:
-                    success_count += 1
+        success_count = sum(
+            1 for record in type_records
+            if (
+                record.price_after_5m > record.trigger_price
+                if direction > 0
+                else record.price_after_5m < record.trigger_price
+            )
+        )
 
         success_rate = success_count / len(type_records)
         return success_rate
@@ -391,12 +387,35 @@ class SignalConfidence:
 
             stats["by_type"][st]["total"] += 1
 
-            if record.price_after_5m is not None:
-                if st in ["放量突破", "冲高做T"]:
-                    if record.price_after_5m > record.trigger_price:
-                        stats["by_type"][st]["success"] += 1
-                elif st in ["跌破支撑", "回踩接回", "回踩支撑", "趋势转弱观察"]:
-                    if record.price_after_5m < record.trigger_price:
-                        stats["by_type"][st]["success"] += 1
+            direction = signal_success_direction(st)
+            if record.price_after_5m is not None and direction is not None:
+                moved_up = record.price_after_5m > record.trigger_price
+                if (direction > 0 and moved_up) or (direction < 0 and not moved_up):
+                    stats["by_type"][st]["success"] += 1
 
         return stats
+
+
+def signal_success_direction(signal_type) -> Optional[int]:
+    """Return the price direction that makes a directional signal successful."""
+    value = _signal_type_value(signal_type)
+    if value in {
+        IntradaySignalType.BREAKOUT.value,
+        IntradaySignalType.RECLAIM_SUPPORT.value,
+        IntradaySignalType.T_BUY.value,
+        IntradaySignalType.PULLBACK.value,
+    }:
+        return 1
+    if value in {
+        IntradaySignalType.BREAK_SUPPORT.value,
+        IntradaySignalType.EXIT_RISK.value,
+        IntradaySignalType.EXIT_WINDOW.value,
+        IntradaySignalType.T_SELL.value,
+        IntradaySignalType.TREND_WEAK.value,
+    }:
+        return -1
+    return None
+
+
+def _signal_type_value(signal_type) -> str:
+    return str(getattr(signal_type, "value", signal_type) or "")

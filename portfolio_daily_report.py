@@ -1266,6 +1266,44 @@ def format_market_context_section(overview) -> List[str]:
     return ["市场背景"] + [f"  {label}：{value}" for label, value in parts]
 
 
+def format_news_impact_section(impacts) -> List[str]:
+    """「七、近两日利好/利空」：只显示有真利好/真利空的个股。
+
+    impacts 来自 news_impact.NewsImpactService（含「无」条目），这里过滤。
+    全部为「无」时保留单行说明——让用户知道这一节跑过，而不是悄悄缺席。
+    """
+    lines = ["七、近两日利好/利空"]
+    qualifying = [
+        item for item in (impacts or [])
+        if str(item.get("direction") or "") in ("利好", "利空")
+    ]
+    if not qualifying:
+        lines.append("  近两日无明确利好/利空事项。")
+    # 风险优先：利空排前面，先看要躲什么再看机会。
+    qualifying.sort(key=lambda item: 0 if item.get("direction") == "利空" else 1)
+    for item in qualifying:
+        name = item.get("name") or item.get("code") or ""
+        note = str(item.get("note") or "").strip()
+        head = f"  {item.get('direction')} {name}"
+        lines.append(f"{head}：{note}" if note else head)
+        evidence_bits = []
+        for evidence in (item.get("evidence") or [])[:2]:
+            title = str(evidence.get("title") or "").strip()
+            if not title:
+                continue
+            source = str(evidence.get("source") or "")
+            date = str(evidence.get("date") or "")
+            evidence_bits.append(f"{source} {date}「{title}」")
+        if evidence_bits:
+            lines.append("    证据：" + "｜".join(evidence_bits))
+    # 口径行：AI 判定 or 降级的关键词口径，用户得知道这一节是谁下的结论。
+    if qualifying and any(item.get("ai") for item in qualifying):
+        lines.append("  （来源：公司公告 + 东财新闻，DeepSeek 判定真伪；仅汇总公开信息，不构成投资建议）")
+    elif qualifying:
+        lines.append("  （口径：公司公告关键词判定——AI 判定不可用，新闻未纳入）")
+    return lines
+
+
 def format_daily_report(
     overview,
     results,
@@ -1273,8 +1311,11 @@ def format_daily_report(
     meta,
     addition=None,
     evaluations=None,
+    news_impact=None,
 ) -> str:
-    """拼装完整报告：盈亏归因、技术整体、整体建议、加仓、优先处理、逐股明细。"""
+    """拼装完整报告：盈亏归因、技术整体、整体建议、加仓、优先处理、逐股明细、
+    近两日利好/利空（news_impact=None 时整节跳过——判定服务不可用，与「全部无
+    利好利空」的单行说明是两回事）。"""
     overview = overview or {}
     results = results or []
     pnl = pnl or {}
@@ -1459,6 +1500,10 @@ def format_daily_report(
             lines.extend(_format_one_position(result, row_by_code.get(result.get("code", "")) or {}))
             lines.append("")
 
+    if news_impact is not None:
+        lines.extend([""])
+        lines.extend(format_news_impact_section(news_impact))
+
     lines.extend([
         "口径：今日盈亏=数量×(现价−昨收)；组合涨跌幅按昨日持仓市值；评分不是上涨概率。",
         "除权日当日盈亏含除权影响。⚠️ 市场有风险，投资需谨慎，不构成投资建议。",
@@ -1530,7 +1575,7 @@ def _format_one_position(result, row) -> List[str]:
     if hold:
         trend_parts.append(
             f"持有策略：{hold.get('state_label') or hold.get('state') or '数据不足'}｜"
-            f"{format_continuation_hold_info(hold)}｜"
+            f"{format_continuation_hold_info(hold, result.get('exit_directive_ok', True))}｜"
         )
     if entry_info.get("can_enter") or result.get("can_enter"):
         trend_parts.append("日线就绪（非交易执行）｜")

@@ -147,7 +147,7 @@ class TechnicalSummary:
         if hold_info:
             hold_strategy = (
                 f"{hold_info.get('state_label') or hold_info.get('state') or '数据不足'}｜"
-                f"{format_continuation_hold_info(hold_info)}"
+                f"{format_continuation_hold_info(hold_info, result.get('exit_directive_ok', True))}"
             )
         strong_risk = format_strong_risk(strong_info)
         if entry_info.get("can_enter") or result.get("can_enter"):

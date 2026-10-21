@@ -7,6 +7,58 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
 
+# 仓位小的口径：持仓成本占组合总成本不超过这个百分比（约等于「买的也不多」）。
+SMALL_POSITION_SHARE_PCT = 10.0
+
+
+def position_cost_share(portfolio: Any, quantity: Any, cost: Any) -> Optional[float]:
+    """持仓成本占组合总成本的百分比；算不出返回 None。
+
+    不依赖 total_capital（用户常不填）和现价（组合里其他票拿不到），
+    成本占比对「我买的也不多」这个直觉足够贴近。
+    """
+    try:
+        qty = float(quantity or 0)
+        cst = float(cost or 0)
+    except (TypeError, ValueError):
+        return None
+    if qty <= 0 or cst <= 0:
+        return None
+    total = 0.0
+    for item in ((portfolio or {}).get("positions") or []):
+        try:
+            other_qty = float(item.get("quantity") or 0)
+            other_cost = float(item.get("cost") or 0)
+        except (TypeError, ValueError):
+            continue
+        if other_qty > 0 and other_cost > 0:
+            total += other_qty * other_cost
+    if total <= 0:
+        return None
+    return qty * cst / total * 100.0
+
+
+def allows_exit_directive(
+    fundamental_level: Any,
+    price_location: Any,
+    position_share_pct: Optional[float] = None,
+) -> bool:
+    """「直接撤出」话术（清仓离场 / 不保留观察仓）的门槛：三者占一才放行。
+
+    - 基本面亮红灯（ALERT），或
+    - 价格处高位（HIGH），或
+    - 仓位不小（成本占比 > 10%）。
+
+    基本面未见恶化 + 价格不高 + 仓位小的持仓只提示风险事实，不给撤出指令
+    （2026-10-22 招商证券：基本面好、位置低位、小仓位却被「不保留确定观察仓」
+    直接劝退）。基本面未分析、仓位算不出按不允许处理——缺证据不喊撤出。
+    """
+    if str(fundamental_level or "").upper() == "ALERT":
+        return True
+    if str(price_location or "").upper() == "HIGH":
+        return True
+    return position_share_pct is not None and position_share_pct > SMALL_POSITION_SHARE_PCT
+
 
 @dataclass(frozen=True)
 class GuardedCopy:

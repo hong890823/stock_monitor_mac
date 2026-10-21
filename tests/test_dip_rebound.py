@@ -20,12 +20,14 @@ def index(change_pct, turnover_ratio=1.4, cumulative=None, timestamp=0.0,
 
 def stock(change_pct, volume_ratio=1.5, cumulative=None, timestamp=0.0,
           atr_pct=None, code="sz002185", name="华天科技",
-          major_trend=None, trend_conflict=None):
+          major_trend=None, trend_conflict=None, day_low_change_pct=None,
+          price=18.0):
     return Sample(
-        code=code, name=name, price=18.0, change_pct=change_pct,
+        code=code, name=name, price=price, change_pct=change_pct,
         volume_ratio=volume_ratio, cumulative_turnover=cumulative,
         timestamp=timestamp, atr_pct=atr_pct, stock=True,
         major_trend=major_trend, trend_conflict=trend_conflict,
+        day_low_change_pct=day_low_change_pct,
     )
 
 
@@ -103,11 +105,33 @@ class TestDipRebound(unittest.TestCase):
         self.assertNotIn("做T减仓", alert.body)
 
     def test_stock_dip_threshold_scales_with_atr(self):
+        # ATR 缩放只把安静股的门槛调浅（-2%~-3%），不再给高波动股加深门槛。
         engine = DipReboundEngine()
-        step(engine, stock(-3.0, atr_pct=3.0))
-        self.assertIsNone(step(engine, stock(-1.0, atr_pct=3.0)))
-        step(engine, stock(-3.8, atr_pct=3.0))
-        self.assertIsNotNone(step(engine, stock(-1.2, atr_pct=3.0)))
+        step(engine, stock(-2.0, atr_pct=1.5))
+        self.assertIsNone(step(engine, stock(-1.0, atr_pct=1.5)))
+        # 高 ATR 股门槛封顶 -3.0%：-3.4% 的坑直接武装（旧版要 -5% 永远等不到）。
+        engine = DipReboundEngine()
+        step(engine, stock(-3.4, atr_pct=5.4))
+        self.assertIsNotNone(step(engine, stock(-0.4, atr_pct=5.4)))
+
+    def test_zhongtian_v_rebound_2026_10_22(self):
+        # 中天科技 2026-10-22 实盘漏报回归：昨收 28.30，低点 27.34（-3.4%），
+        # 反弹到 28.20（-0.4%）。ATR≈5.4% 的高波动股 + 收复 3.0pp 必须提醒。
+        engine = DipReboundEngine()
+        step(engine, stock(-3.39, atr_pct=5.37, price=27.34))
+        alert = step(engine, stock(-0.35, atr_pct=5.37, price=28.20))
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert.stage, 2)
+
+    def test_quote_day_low_arms_dip_when_sampling_missed_bottom(self):
+        # 采样空窗错过坑底（弹窗冻结/断网）：快照日低要能武装下探，
+        # 恢复采样后第一轮就该补发确认。
+        engine = DipReboundEngine()
+        alert = step(engine, stock(
+            -0.5, atr_pct=None, day_low_change_pct=-3.4,
+        ))
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert.stage, 2)
 
     def test_rebound_leg_pace_decides_not_cumulative_ratio(self):
         engine = DipReboundEngine()
@@ -389,3 +413,120 @@ class TestDipReboundWatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestReboundFade(unittest.TestCase):
+    """阶段三「反弹回落」：阶段2 乐观结论的跟进（2026-10-22 中天科技盲区）。"""
+
+    def _fire_stage2(self, engine):
+        step(engine, stock(-3.5))                              # 低点 -3.5%
+        alert = step(engine, stock(-1.0, timestamp=100.0))     # 回升 2.5pp → 阶段2
+        self.assertEqual(alert.stage, 2)
+
+    def test_fade_fires_when_half_of_gain_given_back(self):
+        engine = DipReboundEngine()
+        self._fire_stage2(engine)   # 峰值 2.5pp
+        # 缩回 1.1pp（<峰值一半 1.25），持续 2 采样 / ≥120 秒
+        self.assertIsNone(step(engine, stock(-2.4, timestamp=200.0)))
+        alert = step(engine, stock(-2.4, timestamp=330.0))
+        self.assertIsNotNone(alert)
+        self.assertEqual(alert.stage, 3)
+        self.assertIn("回吐过半", alert.body)
+        self.assertIn("深跌回升", alert.body)
+        self.assertFalse(alert.vibrate)
+
+    def test_fade_silent_when_gain_held(self):
+        engine = DipReboundEngine()
+        self._fire_stage2(engine)   # 峰值 2.5pp
+        # 回升缩到 1.5pp，仍高于峰值一半 1.25 → 不报
+        self.assertIsNone(step(engine, stock(-2.0, timestamp=200.0)))
+        self.assertIsNone(step(engine, stock(-2.0, timestamp=330.0)))
+
+    def test_fade_needs_sustained_drop_not_single_tick(self):
+        engine = DipReboundEngine()
+        self._fire_stage2(engine)
+        self.assertIsNone(step(engine, stock(-2.4, timestamp=200.0)))
+        # 一根就涨回 → probe 清零，不报
+        self.assertIsNone(step(engine, stock(-1.2, timestamp=260.0)))
+        self.assertIsNone(step(engine, stock(-2.4, timestamp=330.0)))
+
+    def test_fade_not_before_stage2(self):
+        # 只有阶段1（反弹观察）不谈回落——观察本身措辞就带「再创新低即取消」。
+        engine = DipReboundEngine()
+        step(engine, stock(-3.5))
+        step(engine, stock(-2.6, timestamp=100.0))
+        alert = step(engine, stock(-2.6, timestamp=150.0))
+        self.assertEqual(alert.stage, 1)
+        self.assertIsNone(step(engine, stock(-3.2, timestamp=300.0)))
+        self.assertIsNone(step(engine, stock(-3.2, timestamp=450.0)))
+
+    def test_fade_fires_once_per_episode(self):
+        engine = DipReboundEngine()
+        self._fire_stage2(engine)
+        step(engine, stock(-2.4, timestamp=200.0))
+        self.assertIsNotNone(step(engine, stock(-2.4, timestamp=330.0)))
+        # 同段继续走弱不再报
+        self.assertIsNone(step(engine, stock(-2.8, timestamp=450.0)))
+        self.assertIsNone(step(engine, stock(-2.8, timestamp=600.0)))
+
+
+class TestStatePersistence(unittest.TestCase):
+    """重启恢复防重报（2026-10-22 15:52 重启重报「反弹观察」）。"""
+
+    def test_export_restore_suppresses_stage2_rereport(self):
+        engine = DipReboundEngine()
+        step(engine, stock(-3.5))
+        alert = step(engine, stock(-1.0, timestamp=100.0))
+        self.assertEqual(alert.stage, 2)
+
+        restored = DipReboundEngine()
+        restored.restore_state(engine.export_state())
+        # 同日同样的回升不再重报
+        self.assertIsNone(step(restored, stock(-1.0, timestamp=200.0)))
+
+    def test_export_restore_suppresses_stage1_rereport(self):
+        engine = DipReboundEngine()
+        step(engine, stock(-3.5, atr_pct=3.0))
+        step(engine, stock(-2.6, atr_pct=3.0, timestamp=100.0))
+        alert = step(engine, stock(-2.6, atr_pct=3.0, timestamp=150.0))
+        self.assertEqual(alert.stage, 1)
+
+        restored = DipReboundEngine()
+        restored.restore_state(engine.export_state())
+        self.assertIsNone(step(restored, stock(-2.6, atr_pct=3.0, timestamp=300.0)))
+
+    def test_export_restore_suppresses_fade_rereport(self):
+        engine = DipReboundEngine()
+        step(engine, stock(-3.5))
+        step(engine, stock(-1.0, timestamp=100.0))
+        step(engine, stock(-2.4, timestamp=200.0))
+        alert = step(engine, stock(-2.4, timestamp=330.0))
+        self.assertEqual(alert.stage, 3)
+
+        restored = DipReboundEngine()
+        restored.restore_state(engine.export_state())
+        self.assertIsNone(step(restored, stock(-2.5, timestamp=500.0)))
+        self.assertIsNone(step(restored, stock(-2.5, timestamp=700.0)))
+
+    def test_restore_tolerates_garbage(self):
+        engine = DipReboundEngine()
+        engine.restore_state(None)
+        engine.restore_state("not a dict")
+        engine.restore_state({"day": "2026-10-22", "states": {
+            "sz002185": {"day_low_pct": "bad"},   # 坏条目忽略
+            "sz000100": {"day_low_pct": -3.0, "watch_emitted": True},
+        }})
+        self.assertEqual(engine._day, "2026-10-22")
+        self.assertNotIn("sz002185", engine._states)
+        self.assertTrue(engine._states["sz000100"].watch_emitted)
+
+    def test_new_day_still_resets_after_restore(self):
+        engine = DipReboundEngine()
+        step(engine, stock(-3.5), day="2026-10-22")
+        restored = DipReboundEngine()
+        restored.restore_state(engine.export_state())
+        # 恢复的是旧交易日状态，新交易日照常重新计数
+        alert = step(restored, stock(-3.5), day="2026-10-23")
+        self.assertIsNone(alert)   # 首个采样即低点，只建状态
+        alert = step(restored, stock(-1.0, timestamp=100.0), day="2026-10-23")
+        self.assertIsNotNone(alert)

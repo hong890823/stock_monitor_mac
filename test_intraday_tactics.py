@@ -8,6 +8,7 @@
 """
 
 import unittest
+from unittest.mock import patch
 from intraday_tactics import IntradayTactics, IntradaySignalType, limit_pct_for_board
 from market_environment import MarketEnvironmentStatus, evaluate_market_environment
 
@@ -579,28 +580,22 @@ class TestAntiSpam(unittest.TestCase):
         self.assertIsNone(signal3)
 
     def test_signal_resets_when_condition_clears(self):
-        """条件消失后信号状态重置"""
+        """条件消失只重置跃迁，不绕过同信号冷却"""
         kwargs_break = dict(
             code="sh600519", name="贵州茅台", price=1750.0,
             change_pct=-2.0, volume_ratio=1.0, limit_pct=10.0,
             support=1780.0, resistance=1850.0, score=3, quantity=100,
         )
-        # 触发跌破支撑
-        signal1 = self.tactics.check_signal(**kwargs_break)
-        self.assertIsNotNone(signal1)
-
-        # 价格回到支撑上方（条件消失）
         kwargs_ok = dict(
             code="sh600519", name="贵州茅台", price=1800.0,
             change_pct=0.5, volume_ratio=1.0, limit_pct=10.0,
             support=1780.0, resistance=1850.0, score=3, quantity=100,
         )
-        signal2 = self.tactics.check_signal(**kwargs_ok)
-        self.assertIsNone(signal2)
-
-        # 再次跌破支撑（应该能再次触发）
-        signal3 = self.tactics.check_signal(**kwargs_break)
-        self.assertIsNotNone(signal3)
+        with patch("intraday_tactics.time.time", side_effect=[100.0, 111.0, 122.0, 701.0]):
+            self.assertIsNotNone(self.tactics.check_signal(**kwargs_break))
+            self.assertIsNone(self.tactics.check_signal(**kwargs_ok))
+            self.assertIsNone(self.tactics.check_signal(**kwargs_break))
+            self.assertIsNotNone(self.tactics.check_signal(**kwargs_break))
 
     def test_pending_cleared_when_condition_clears(self):
         """待确认状态在条件消失时清除"""

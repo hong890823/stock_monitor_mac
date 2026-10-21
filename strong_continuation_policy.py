@@ -119,8 +119,13 @@ def assess_strong_continuation(value: StrongContinuationInput) -> StrongContinua
     if price_location == "":
         reasons.append("价格位置缺失，按MA5采用更保守风险线")
 
+    # 派发是高位/延伸段现象：低位票破支撑只是走弱破位，不能叫「派发风险」，
+    # 否则持有策略会接「不保留确定观察仓」的撤出结论（2026-10-22 招商证券
+    # 位置低位被误判派发，直接劝退）。位置未知也不放行——缺证据不喊撤出。
+    extended = price_location == "HIGH" or (bias is not None and bias >= 8.0)
     distribution = (
-        value.support_holds is False
+        extended
+        and value.support_holds is False
         and (
             value.lower_pivots_rising is False
             or (volume is not None and volume >= 1.5)

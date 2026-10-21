@@ -71,6 +71,23 @@ class ContinuationHoldPolicyTests(unittest.TestCase):
         ))
         self.assertEqual(result.state, ContinuationHoldState.DISTRIBUTION_RISK)
 
+    def test_distribution_exit_copy_downgraded_without_exit_evidence(self):
+        # 基本面未亮红灯 + 价格不高 + 仓位小 → 只报风险事实，不喊「不保留确定观察仓」。
+        result = assess_continuation_hold(base(
+            strong_state="DISTRIBUTION_RISK", high_state="SECOND_WAVE_CANDIDATE",
+        ))
+        text = format_continuation_hold(result, exit_directive_ok=False)
+        self.assertIn("仅提示风险事实", text)
+        self.assertIn("不必直接撤出", text)
+        self.assertNotIn("不保留确定观察仓", text)
+
+    def test_distribution_exit_copy_still_direct_when_evidence_present(self):
+        result = assess_continuation_hold(base(
+            strong_state="DISTRIBUTION_RISK", high_state="SECOND_WAVE_CANDIDATE",
+        ))
+        text = format_continuation_hold(result, exit_directive_ok=True)
+        self.assertIn("不保留确定观察仓", text)
+
     def test_missing_evidence_never_says_keep_or_trim(self):
         result = assess_continuation_hold(ContinuationHoldInput(
             strong_state="MISSING", high_state="MISSING",

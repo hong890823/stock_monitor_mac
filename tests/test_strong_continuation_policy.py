@@ -109,11 +109,24 @@ class StrongContinuationPolicyTests(unittest.TestCase):
 
     def test_distribution_evidence_wins_over_dynamic_break(self):
         result = assess_strong_continuation(base(
-            price=9.8, lower_pivots_rising=False, support_holds=False,
+            price=9.8, price_location="HIGH", bias_pct=9.0,
+            lower_pivots_rising=False, support_holds=False,
             volume_ratio=1.8,
         ))
 
         self.assertEqual(result.state, StrongContinuationState.DISTRIBUTION_RISK)
+
+    def test_low_position_break_is_not_called_distribution(self):
+        # 2026-10-22 招商证券：位置低位 + 破支撑 + 低点下移被判「派发风险」，
+        # 持有策略接「不保留确定观察仓」直接劝退。派发是高位概念，
+        # 低位破位只能走破位风险分支。
+        result = assess_strong_continuation(base(
+            price=15.95, ma5=16.2, ma10=16.5, ma20=17.07, ma20_prev=17.1,
+            price_location="LOW", bias_pct=-6.5, breakout_reference=18.12,
+            lower_pivots_rising=False, support_holds=False, volume_ratio=0.94,
+        ))
+
+        self.assertNotEqual(result.state, StrongContinuationState.DISTRIBUTION_RISK)
 
     def test_non_bullish_ma_alignment_is_not_strong(self):
         result = assess_strong_continuation(base(ma10=10.9))

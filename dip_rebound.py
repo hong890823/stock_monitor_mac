@@ -26,8 +26,6 @@ from collections import deque
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-from trade_action_guard import guard_actionable_copy
-
 # 大盘指数：日内低点较昨收跌到这个幅度才算「下探够深」（上证 4000 点时约 28 点）。
 INDEX_DIP_PCT = -0.7
 
@@ -40,11 +38,16 @@ INDEX_REBOUND_PCT = 0.5
 # 持仓个股：日内低点较昨收跌到这个幅度才算被砸（无 ATR 时的兜底）。
 STOCK_DIP_PCT = -3.0
 
-# 个股下探阈值按 ATR% 缩放的系数：约 1.2 个 ATR 日的砸盘才算被砸。
+# 个股下探阈值按 ATR% 缩放的系数。缩放只负责把安静股的门槛调浅（-2%~-3%），
+# 高波动股无论 ATR 多大都封顶在 -3%（STOCK_DIP_MIN_PCT）：此前按 1.2×ATR 且
+# 允许到 -5%，中天科技这类 ATR 5%+ 的票 -3.4% 的坑永远"不够深"，
+# 27.4→28.2 的 V 型收复整段漏报（2026-10-22 用户实盘反馈）。
 STOCK_DIP_ATR_MULT = 1.2
 
-# 缩放后的个股下探阈值上下限。
-STOCK_DIP_MIN_PCT = -5.0
+# 缩放后的个股下探阈值上下限。下限由 -5% 收到 -3%（2026-10-22）：中天科技这类
+# 高波动股按 1.2×ATR 会要求 -5% 级别的恐慌坑，-3.4% 下探 + 3% 收复的 V 型被整段
+# 漏掉——下探门槛最深与兜底口径对齐，ATR 缩放只负责把安静股的门槛调浅。
+STOCK_DIP_MIN_PCT = -3.0
 STOCK_DIP_MAX_PCT = -2.0
 
 # 个股回升门槛 = 下探幅度的这个比例（默认下探 -3% 时正好是 2%）。
@@ -65,9 +68,20 @@ VOLUME_CONFIRM_RATIO = 1.3
 # 每个代码每天最多提醒几次，防止深 V 来回刷屏。
 MAX_PER_DAY = 3
 
+# ── 反弹回落跟进（阶段2 之后） ────────────────────────────────────
+# 阶段2 报的是「深跌回升」的乐观结论，回升失败时此前没有任何跟进
+# （2026-10-22 中天科技 28.20→27.61 回落全程零提醒）。规则：
+# 回升幅度过半被回吐（recovered < 0.5 × 本段峰值）且持续一段时间，
+# 补一条「反弹回落」事实提醒；每段一次、每日限次，再创新低则重新起段。
+FADE_TRIGGER_RATIO = 0.5
+FADE_MIN_PEAK_PCT = 1.0   # 回升峰值低于此不谈「回落」（指数小反弹防噪声）
+FADE_MIN_SAMPLES = 2
+FADE_MIN_HOLD_SEC = 120.0
+FADE_MAX_PER_DAY = 2
+
 # ── 阶段一「反弹观察」 ────────────────────────────────────────────
 # 观察门槛 = max(WATCH_REBOUND_MIN_PCT, WATCH_REBOUND_OF_DIP × |dip_threshold|)。
-# 例：dip 门槛 -3% → 观察 0.75%；-2%（钳制上限）→ 0.5%；ATR 缩放 -3.6% → 0.9%。
+# 例：dip 门槛 -3% → 观察 0.75%；-2%（钳制上限）→ 0.5%。
 # 阶段二仍是 2/3 门槛（-3% 时 2.0%），阶段一比它早约 1~3 个 15s tick。
 WATCH_REBOUND_MIN_PCT = 0.5
 WATCH_REBOUND_OF_DIP = 0.25
@@ -101,6 +115,15 @@ MARKET_WEAK_PCT = -1.0
 # 趋势标签双口径（与 intraday_tactics 一致：dict 里可能是枚举名也可能是中文 value）。
 _TREND_DOWN_LABELS = frozenset({"DOWN", "大趋势向下"})
 _CONFLICT_DOWN_REBOUND_LABELS = frozenset({"DOWN_MAJOR_REBOUND", "下跌趋势中的反弹"})
+
+
+def _opt_float(value) -> Optional[float]:
+    """状态恢复用：可缺失/可坏，坏值返回 None。"""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
 
 
 def dip_threshold_pct(code: str, stock: bool, atr_pct: Optional[float] = None) -> float:
@@ -139,7 +162,9 @@ def trend_down_risk(sample: "Sample") -> bool:
 @dataclass
 class Sample:
     """一轮检测输入。cumulative_turnover 为当日累计成交额（元），
-    volume_ratio 为同期累计倍数（只作算不出节奏时的退路）。"""
+    volume_ratio 为同期累计倍数（只作算不出节奏时的退路）。
+    day_low_change_pct 为行情快照的日内最低价对昨收涨跌%（可选）：
+    采样可能漏掉闪跌低点，或因弹窗/网络造成采样空窗错过坑底，用它锚定真低点。"""
     code: str
     name: str
     price: float
@@ -152,6 +177,7 @@ class Sample:
     # 趋势上下文（可选，由调用方从 entry_structure["trend_assessment"] 透传）。
     major_trend: Optional[str] = None
     trend_conflict: Optional[str] = None
+    day_low_change_pct: Optional[float] = None
 
 
 @dataclass
@@ -161,7 +187,7 @@ class Alert:
     body: str
     vibrate: bool
     stock: bool
-    stage: int = 2  # 1=反弹观察（低 key）, 2=深跌回升确认；默认 2 保持旧调用兼容
+    stage: int = 2  # 1=反弹观察, 2=深跌回升确认, 3=反弹回落；默认 2 保持旧调用兼容
 
 
 class _State:
@@ -170,6 +196,7 @@ class _State:
         "first_ts", "first_cum", "emitted_low_pct", "emitted_count",
         "watch_emitted", "watch_count", "watch_probe_ts", "watch_probe_ticks",
         "pace_points",
+        "peak_recovered", "fade_emitted", "fade_count", "fade_probe_ts", "fade_probe_ticks",
     )
 
     def __init__(self, day_low_pct: float):
@@ -185,6 +212,12 @@ class _State:
         self.watch_probe_ts: Optional[float] = None
         self.watch_probe_ticks = 0
         self.pace_points: deque = deque(maxlen=8)
+        # 反弹回落跟进：本段回升峰值、回落判定与防闪动 probe
+        self.peak_recovered = 0.0
+        self.fade_emitted = False
+        self.fade_count = 0
+        self.fade_probe_ts: Optional[float] = None
+        self.fade_probe_ticks = 0
 
 
 class DipReboundEngine:
@@ -220,6 +253,55 @@ class DipReboundEngine:
         self._day = None
         self._states.clear()
 
+    def export_state(self) -> dict:
+        """持久化抑制类状态（重启恢复防重报）；措辞类字段（量能节奏等）不导出。
+
+        2026-10-22 15:52 重启后重报了一次当日已触发的「反弹观察」——
+        内存状态随进程消失，发射记录必须落盘。
+        """
+        return {
+            "day": self._day,
+            "states": {
+                code: {
+                    "day_low_pct": s.day_low_pct,
+                    "emitted_low_pct": s.emitted_low_pct,
+                    "emitted_count": s.emitted_count,
+                    "watch_emitted": s.watch_emitted,
+                    "watch_count": s.watch_count,
+                    "peak_recovered": s.peak_recovered,
+                    "fade_emitted": s.fade_emitted,
+                    "fade_count": s.fade_count,
+                }
+                for code, s in self._states.items()
+            },
+        }
+
+    def restore_state(self, data) -> None:
+        """恢复 export_state 的输出；坏数据逐条忽略，不整体报错。"""
+        if not isinstance(data, dict):
+            return
+        day = data.get("day")
+        if isinstance(day, str) and day:
+            self._day = day
+        states = data.get("states")
+        if not isinstance(states, dict):
+            return
+        for code, item in states.items():
+            if not isinstance(item, dict):
+                continue
+            try:
+                state = _State(float(item["day_low_pct"]))
+                state.emitted_low_pct = _opt_float(item.get("emitted_low_pct"))
+                state.emitted_count = int(item.get("emitted_count") or 0)
+                state.watch_emitted = bool(item.get("watch_emitted"))
+                state.watch_count = int(item.get("watch_count") or 0)
+                state.peak_recovered = float(item.get("peak_recovered") or 0.0)
+                state.fade_emitted = bool(item.get("fade_emitted"))
+                state.fade_count = int(item.get("fade_count") or 0)
+            except (TypeError, ValueError, KeyError):
+                continue
+            self._states[str(code)] = state
+
     def _evaluate(self, sample: Sample, market_change_pct: Optional[float] = None) -> Optional[Alert]:
         try:
             price = float(sample.price)
@@ -230,34 +312,62 @@ class DipReboundEngine:
             return None
         if not math.isfinite(change_pct):
             return None
+        # 当日低点取「采样到的 change_pct」与「行情快照日低」的更小者：
+        # 15s 采样可能漏掉闪跌低点，弹窗卡死/网络断流的空窗期更是整段错过坑底
+        # （2026-10-22 中天科技 13:45 见底 27.34 时主线程正被 crash 弹窗冻结），
+        # 快照的 low 字段是权威日低，用它锚定才不会把「反弹」误判成「没跌够」。
+        observed_low = change_pct
+        if sample.day_low_change_pct is not None:
+            try:
+                quote_low = float(sample.day_low_change_pct)
+            except (TypeError, ValueError):
+                quote_low = None
+            if quote_low is not None and math.isfinite(quote_low) and quote_low < observed_low:
+                observed_low = quote_low
         state = self._states.get(sample.code)
         if state is None:
-            state = _State(change_pct)
-            # 首个采样即当日低点时也要锚定时间/累计量，否则急拉与节奏都算不出。
-            state.day_low_ts = sample.timestamp
-            state.day_low_cum = sample.cumulative_turnover
+            state = _State(observed_low)
+            if observed_low == change_pct:
+                # 首个采样即当日低点时也要锚定时间/累计量，否则急拉与节奏都算不出。
+                state.day_low_ts = sample.timestamp
+                state.day_low_cum = sample.cumulative_turnover
+            # 低点来自快照（采样空窗前跌出的坑）：时刻未知，时间/累计量留空，
+            # 节奏与急拉文案按「算不出」降级，不瞎猜。
             self._states[sample.code] = state
         if state.first_ts is None:
             state.first_ts = sample.timestamp
             state.first_cum = sample.cumulative_turnover
         if sample.cumulative_turnover is not None:
             state.pace_points.append((sample.timestamp, sample.cumulative_turnover, change_pct))
-        if change_pct < state.day_low_pct:
-            state.day_low_pct = change_pct
-            state.day_low_ts = sample.timestamp
-            state.day_low_cum = sample.cumulative_turnover
+        if observed_low < state.day_low_pct:
+            state.day_low_pct = observed_low
+            if observed_low == change_pct:
+                state.day_low_ts = sample.timestamp
+                state.day_low_cum = sample.cumulative_turnover
+            else:
+                # 快照口径的新低（采样没踩到坑底）：时刻未知，清锚点让量能
+                # 节奏退回累计量比口径，不用旧锚点算出误导性的「放量/缩量」。
+                state.day_low_ts = None
+                state.day_low_cum = None
             if state.watch_emitted:
                 # 再创新低：观察作废、重新武装。静默处理（文案承诺「再创新低即取消」，
                 # 连环新低逐条发取消通知只会刷屏），下一段回升重新观察。
                 state.watch_emitted = False
                 state.watch_probe_ts = None
                 state.watch_probe_ticks = 0
+            # 新段：回升峰值与回落判定重来（回落跟进是「每段一次」）。
+            state.peak_recovered = 0.0
+            state.fade_emitted = False
+            state.fade_probe_ts = None
+            state.fade_probe_ticks = 0
 
         day_low = state.day_low_pct
         dip_threshold = dip_threshold_pct(sample.code, sample.stock, sample.atr_pct)
         if day_low > dip_threshold:
             return None
         recovered = change_pct - day_low
+        if recovered > state.peak_recovered:
+            state.peak_recovered = recovered
         episode_done = (
             state.emitted_low_pct is not None and day_low >= state.emitted_low_pct
         )
@@ -307,7 +417,51 @@ class DipReboundEngine:
                             sample, day_low, recovered, leg,
                             stage=1, watch_th=watch_th, risk_flags=flags,
                         )
+
+        # 阶段三：反弹回落跟进。阶段2 报的是「深跌回升」的乐观结论，
+        # 回升失败此前没有任何跟进（2026-10-22 中天科技 28.20→27.61 回落
+        # 全程零提醒）。只报事实：回升幅度过半被回吐且持续即补一条，
+        # 不给买卖指令；每段一次、每日限次。
+        if (
+            episode_done
+            and not state.fade_emitted
+            and state.fade_count < FADE_MAX_PER_DAY
+            and state.peak_recovered >= FADE_MIN_PEAK_PCT
+        ):
+            if recovered < FADE_TRIGGER_RATIO * state.peak_recovered:
+                state.fade_probe_ticks += 1
+                if state.fade_probe_ts is None:
+                    state.fade_probe_ts = sample.timestamp
+                if (
+                    state.fade_probe_ticks >= FADE_MIN_SAMPLES
+                    and sample.timestamp - state.fade_probe_ts >= FADE_MIN_HOLD_SEC
+                ):
+                    state.fade_emitted = True
+                    state.fade_count += 1
+                    return self._build_fade_alert(sample, state, day_low, recovered)
+            else:
+                # 回升重新走强就清 probe——「跌→回」不算持续回落。
+                state.fade_probe_ts = None
+                state.fade_probe_ticks = 0
         return None
+
+    def _build_fade_alert(
+        self, sample: Sample, state: _State, day_low: float, recovered: float,
+    ) -> Alert:
+        prev_close = sample.price / (1 + sample.change_pct / 100.0)
+        low_price = prev_close * (1 + day_low / 100.0)
+        title = f"📉 {sample.name}·反弹回落"
+        body = (
+            f"{sample.name}日内最低 {low_price:.2f}（{day_low:+.1f}%），"
+            f"自低点回升最多 {state.peak_recovered:.1f}% 后回落，"
+            f"现回升缩至 {recovered:.1f}%——回吐过半。"
+            "此前「深跌回升」未稳，仅提示盘面事实；"
+            "以收回支撑、企稳为准，再创新低则重新观察。"
+        )
+        return Alert(
+            code=sample.code, title=title, body=body,
+            vibrate=False, stock=sample.stock, stage=3,
+        )
 
     @staticmethod
     def _leg_pace_ratio(sample: Sample, state: _State) -> Optional[float]:
@@ -465,12 +619,9 @@ class DipReboundEngine:
                 f"自低点回升 {recovered:.1f}%（观察门槛 {watch_th:.1f}%）"
             )
             title = f"📊 {sample.name}·反弹观察"
-            guarded = guard_actionable_copy(
-                "buy", "反弹观察：尚未确认，谨防诱多。", trade_date=None
-            )
             body = (
                 f"{head}；{self._volume_text(sample, leg, strong)}。"
-                f"{guarded.text}尚未确认，谨防诱多；再创新低即取消。"
+                "仅观察：尚未确认，谨防诱多；再创新低即取消。"
                 f"{risk_text}（观察状态：反弹观察）"
             )
             return Alert(
@@ -482,7 +633,7 @@ class DipReboundEngine:
         if sample.stock and strong:
             title = f"💰 {sample.name}·深跌回升（放量）"
             takeaway = (
-                "回升段有资金承接迹象——可对照个股剧本②留意补仓/做T窗口；"
+                "回升段有资金承接迹象，仅作超跌反弹观察；"
                 "仍以收回支撑、企稳为准，再创新低则取消。"
             )
         elif sample.stock:
@@ -491,13 +642,12 @@ class DipReboundEngine:
         elif strong:
             title = f"💰 {sample.name}·下探回升（放量）"
             takeaway = (
-                "回升段有资金承接迹象——深套持仓可对照个股剧本②留意补仓/做T窗口"
-                "（个股以收回支撑、企稳为准）。"
+                "回升段有资金承接迹象——指数反弹不替代个股判断，"
+                "深套持仓仍以个股收回支撑、企稳为准。"
             )
         else:
             title = f"📈 {sample.name}·下探回升"
             takeaway = "回升段量能偏弱，先按超跌反弹观察；深套持仓若要补仓仍等个股企稳确认。"
-        guarded_takeaway = guard_actionable_copy("buy", takeaway, trade_date=None)
         observation_state = "深跌回升" if strong else "超跌反弹"
         upgrade_note = "（自「反弹观察」升级确认）" if upgraded else ""
         head = (
@@ -506,7 +656,7 @@ class DipReboundEngine:
         )
         body = (
             f"{head}；{self._volume_text(sample, leg, strong)}。"
-            f"{guarded_takeaway.text}{risk_text}（观察状态：{observation_state}）{upgrade_note}"
+            f"仅观察：{takeaway}{risk_text}（观察状态：{observation_state}）{upgrade_note}"
         )
         vibrate = strong and not trend_down_risk(sample) and not selling_pressure
         return Alert(

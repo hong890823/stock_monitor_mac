@@ -830,6 +830,17 @@ class IntradayTactics:
             time.time() + max(0.0, float(retry_after_seconds))
         )
 
+    def release_signal_attempt(
+        self, code: str, signal_type: IntradaySignalType
+    ) -> None:
+        """Release a candidate's budget when policy downgrades it to waiting."""
+        state = self._ensure_state(code)
+        state["daily_count"][signal_type] = max(
+            0, state["daily_count"].get(signal_type, 0) - 1
+        )
+        if signal_type not in self.RISK_SIGNALS:
+            state["shared_count"] = max(0, state["shared_count"] - 1)
+
     def check_signal(
         self,
         code: str,
@@ -928,15 +939,21 @@ class IntradayTactics:
         if quantity <= 0 and signal is not None and signal.signal_type != IntradaySignalType.PULLBACK:
             signal = None
 
-        # 无信号 → 清除所有已触发状态、待确认状态和冷却（允许后续重新触发）
+        # 无信号只释放跃迁状态；发送冷却继续生效，避免条件横跳绕过防刷。
         if signal is None:
             state["triggered"].clear()
             state["pending"].clear()
-            state["last_signal_time"].clear()
-            state["defer_until"].clear()
             return None
 
         st = signal.signal_type
+        if (
+            st not in self.RISK_SIGNALS
+            and confirmation_rounds is not None
+            and int(confirmation_rounds) <= 0
+        ):
+            state["triggered"].discard(st)
+            state["pending"].pop(st, None)
+            return None
 
         # evaluate 按优先级只返回一个信号：换了类型说明旧类型的条件已消失，
         # 从 triggered / pending / 冷却里清掉，允许后续重新触发
@@ -948,12 +965,6 @@ class IntradayTactics:
         for other in list(state["pending"]):
             if other != st:
                 state["pending"].pop(other, None)
-        for other in list(state["last_signal_time"]):
-            if other != st:
-                state["last_signal_time"].pop(other, None)
-        for other in list(state["defer_until"]):
-            if other != st:
-                state["defer_until"].pop(other, None)
 
         defer_until = state["defer_until"].get(st)
         if defer_until is not None:
@@ -990,7 +1001,15 @@ class IntradayTactics:
         if st in self.CONFIRM_REQUIRED:
             # 确定需要的确认轮数
             required_rounds = confirmation_rounds if confirmation_rounds is not None else 2
-            required_rounds = max(1, required_rounds)  # 至少1轮
+            required_rounds = int(required_rounds)
+
+            if required_rounds == 1:
+                state["triggered"].add(st)
+                state["last_signal_time"][st] = now
+                state["daily_count"][st] = state["daily_count"].get(st, 0) + 1
+                if st not in self.RISK_SIGNALS:
+                    state["shared_count"] += 1
+                return signal
 
             if st not in state["pending"]:
                 # 第一轮：记录待确认，设置需要的轮数

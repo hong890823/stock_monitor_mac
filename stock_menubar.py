@@ -49,6 +49,9 @@ from sector_leaders import (
     parse_leader_list_text,
     rank_leader_candidates,
 )
+from limit_seal_events import SealEventTracker, SealTick
+from intraday_ignition import IgnitionSample, IgnitionTracker
+from alert_repeat_guard import AlertRepeatGuard
 from five_one_three import (
     FiveOneThreeStage,
     inspect as inspect_five_one_three,
@@ -71,6 +74,7 @@ from portfolio_daily_report import (
     portfolio_fingerprint,
 )
 from deep_loss_policy import suggested_add_quantity
+from news_impact import NewsImpactService
 from intraday_bars import build_timeframe_evidence, fetch_intraday_bars
 from intraday_trade_policy import (
     DecisionAction,
@@ -117,6 +121,7 @@ from trade_ledger import TradeLedger, parse_trade_text
 from market_levels import compute_levels, merge_live_bar
 from observation_pool import ObservationPool
 from observation_alerts import ObservationEntryTracker, is_entry_session
+from quote_clock import parse_quote_clock
 from observation_ui import build_observation_view, decorate_stock, prioritize_stocks, indicator_color
 try:
     from entry_review_service import EntryReviewService
@@ -788,6 +793,10 @@ class StockMenuBar(rumps.App):
         self.sector_tech_file = os.path.join(self.log_dir, "_sector_tech_cache.json")
         self.indicator_refresh_state_file = os.path.join(
             self.log_dir, "indicator_refresh_state.json"
+        )
+        # 三个盘中事件 tracker（下探回升/封板/点火）的抑制状态：重启防重报。
+        self.tracker_state_file = os.path.join(
+            self.log_dir, "intraday_trackers_state.json"
         )
         self.five_one_three_state_file = os.path.join(
             self.log_dir, "five_one_three_state.json"
@@ -1930,6 +1939,8 @@ class StockMenuBar(rumps.App):
                 row['bid1_price'] = self._safe_float(parts[11], 0.0)
                 row['ask1_price'] = self._safe_float(parts[7], 0.0)
                 row['ask1_vol'] = self._safe_float(parts[20], 0.0)
+                row['date'] = parts[30] if len(parts) > 30 else ''
+                row['time'] = parts[31] if len(parts) > 31 else ''
             result.append(row)
         return result
 
@@ -4015,6 +4026,16 @@ class StockMenuBar(rumps.App):
         # 使用 rumps.Timer 确保回调在主线程执行
         self.timer = rumps.Timer(self.on_timer_tick, self.update_interval)
         self.timer.start()
+        # rumps 只把 NSTimer 注册进 NSDefaultRunLoopMode：NSAlert.runModal() 期间
+        # run loop 跑在 modal 模式，定时器全部停摆——2026-10-22 13:25 大盘 crash
+        # 弹窗一开就是 52 分钟，行情/预警整段冻结，正赶上中天科技 27.4→28.2 的
+        # V 型反弹，一条提醒都没发。补注册进 common modes，弹窗期间监控继续跑。
+        try:
+            from Foundation import NSRunLoop, NSRunLoopCommonModes
+            NSRunLoop.mainRunLoop().addTimer_forMode_(
+                self.timer._nstimer, NSRunLoopCommonModes)
+        except Exception as error:
+            self.log(f"Timer 注册 common modes 失败（弹窗期间监控会冻结）: {error}", "WARNING")
 
         # 首次数据加载在后台线程（只获取数据，不更新UI）
         threading.Thread(target=self._fetch_data, daemon=True).start()
@@ -4697,13 +4718,26 @@ class StockMenuBar(rumps.App):
             threading.Thread(target=self._maybe_refresh_portfolio_analysis, daemon=True).start()
             self._maybe_refresh_capital_flow()
             # 板块龙头封板/炸板状态（每15秒，只拉已配置龙头）
-            self._check_sector_leaders()
-            # 轻量级盘中信号检测（每15秒）
-            self._check_intraday_signals()
-            # 大盘指数预警检测（每15秒）
-            self._check_market_alerts()
-            # 下探回升检测（每15秒）：大盘 + 持仓股的 V 型收复
-            self._check_dip_rebound()
+            # 各检测独立兜底：任何一个抛异常都不能连累后面的预警饿死
+            # （2026-10-22 上午 check_signal 参数错误连抛 772 次，
+            # 下探回升/大盘预警整段被跳过）。
+            for name, fn in (
+                ("板块龙头检测", self._check_sector_leaders),
+                ("盘中信号检测", self._check_intraday_signals),
+                ("大盘预警检测", self._check_market_alerts),
+                ("下探回升检测", self._check_dip_rebound),
+                ("封板事件检测", self._check_seal_events),
+                ("盘中点火检测", self._check_ignition),
+            ):
+                try:
+                    fn()
+                except Exception as error:
+                    self.log(f"{name}异常（本轮跳过，不影响其余检测）: {error}", "ERROR")
+            # 抑制状态落盘：重启后不重报当日已触发的提醒（每轮一次小原子写）。
+            try:
+                self._save_tracker_states()
+            except Exception as error:
+                self.log(f"盘中事件状态落盘失败（不影响检测）: {error}", "WARNING")
 
             # 每天18:00自动生成盘面总结
             self._auto_refresh_summary()
@@ -5309,6 +5343,60 @@ class StockMenuBar(rumps.App):
             return data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError, AttributeError):
             return {}
+
+    def _save_tracker_states(self):
+        """落盘三个盘中事件 tracker 的抑制状态（重启防重报）。
+
+        内存状态随进程消失，重启后当日已触发的提醒会重报
+        （2026-10-22 15:52 重启重报「反弹观察」实录）。原子写，同 _save_daily_report_state。
+        """
+        payload = {}
+        engine = getattr(self, "_dip_rebound_engine", None)
+        if engine is not None:
+            payload["dip_rebound"] = engine.export_state()
+        seal = getattr(self, "_seal_tracker", None)
+        if seal is not None:
+            payload["seal_events"] = seal.export_state()
+        ignition = getattr(self, "_ignition_tracker", None)
+        if ignition is not None:
+            payload["ignition"] = ignition.export_state()
+        if not payload:
+            return
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=self.log_dir,
+                prefix=".intraday_trackers.", suffix=".tmp", delete=False,
+            ) as handle:
+                temp_path = handle.name
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, self.tracker_state_file)
+        except Exception as error:
+            self.log(f"保存盘中事件状态失败: {error}", "WARNING")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+    def _restore_tracker_state(self, kind, tracker):
+        """从落盘状态恢复单个 tracker；文件缺失/损坏按空状态起步。"""
+        try:
+            with open(self.tracker_state_file, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (OSError, json.JSONDecodeError, AttributeError):
+            return tracker
+        if not isinstance(data, dict):
+            return tracker
+        try:
+            tracker.restore_state(data.get(kind))
+        except Exception as error:
+            self.log(f"恢复盘中事件状态失败({kind}): {error}", "WARNING")
+        return tracker
 
     def _save_daily_report_state(self, state):
         """原子写：坏 json 会让定稿锁丢失或重复定稿，不能直接 open 覆盖。
@@ -7405,6 +7493,13 @@ class StockMenuBar(rumps.App):
             "趋势转弱观察": "M20失守｜暂不加仓，等收回确认",
             "冲高做T": "乖离过大，可分批做 T，回踩接回",
         }
+        if signal == "减仓风险" and not result.get("exit_directive_ok", True):
+            # 基本面未亮红灯 + 价格不高 + 仓位小：不喊「清仓离场」，
+            # 只提示风险事实（2026-10-22 招商证券被直接劝退）。
+            short_actions["减仓风险"] = (
+                "确认破位：基本面未亮红灯、价格不高、仓位轻，仅提示风险事实；"
+                "是否处置等盘中确认，不必直接撤出"
+            )
         title = f"📦 {result['name']}·{signal}"
         subtitle = f"现价 {result['price']:.2f}"
         raw_message = short_actions.get(signal, "请查看持仓分析报告")
@@ -7486,27 +7581,48 @@ class StockMenuBar(rumps.App):
         """
         from dip_rebound import DipReboundEngine, Sample
 
+        def _quote_day_low_pct(data):
+            """行情快照的日低对昨收涨跌%；没有日低/昨收时返回 None。"""
+            low_price = data.get("low")
+            prev_close = data.get("prev_close")
+            try:
+                low_price = float(low_price) if low_price else None
+                prev_close = float(prev_close) if prev_close else None
+            except (TypeError, ValueError):
+                return None
+            if not low_price or not prev_close:
+                return None
+            return (low_price - prev_close) / prev_close * 100
+
         if not hasattr(self, "_dip_rebound_engine"):
-            self._dip_rebound_engine = DipReboundEngine()
-        now = datetime.now()
+            self._dip_rebound_engine = self._restore_tracker_state(
+                "dip_rebound", DipReboundEngine(),
+            )
         samples = []
         for code in self.market_alert_indices:
             data = self.stock_data.get(code)
             if not data or data.get("price") is None:
                 continue
-            samples.append(Sample(
+            clock = parse_quote_clock(data)
+            if clock is None:
+                continue
+            samples.append((clock.day, Sample(
                 code=code,
                 name=data.get("name", code),
                 price=float(data["price"]),
                 change_pct=float(data.get("change_pct", 0) or 0),
                 cumulative_turnover=float(data.get("turnover", 0) or 0),
-                timestamp=now.timestamp(),
+                timestamp=clock.at.timestamp(),
                 stock=False,
-            ))
+                day_low_change_pct=_quote_day_low_pct(data),
+            )))
         position_codes = {p.get("code") for p in self.portfolio.get("positions", [])}
         for code in position_codes:
             data = self.stock_data.get(code)
             if not data or data.get("price") is None:
+                continue
+            clock = parse_quote_clock(data)
+            if clock is None:
                 continue
             result = next(
                 (r for r in getattr(self, "_last_portfolio_results", []) if r.get("code") == code),
@@ -7515,20 +7631,30 @@ class StockMenuBar(rumps.App):
             price = float(data["price"])
             atr_value = (result or {}).get("atr")
             trend = ((result or {}).get("entry_structure") or {}).get("trend_assessment") or {}
-            samples.append(Sample(
+            samples.append((clock.day, Sample(
                 code=code,
                 name=data.get("name", code),
                 price=price,
                 change_pct=float(data.get("change_pct", 0) or 0),
                 volume_ratio=data.get("volume_ratio") or None,
                 cumulative_turnover=float(data.get("turnover", 0) or 0),
-                timestamp=now.timestamp(),
+                timestamp=clock.at.timestamp(),
                 atr_pct=(float(atr_value) / price * 100) if atr_value and price > 0 else None,
                 stock=True,
                 major_trend=trend.get("major_trend"),
                 trend_conflict=trend.get("conflict"),
-            ))
-        for alert in self._dip_rebound_engine.update(samples, now.strftime("%Y-%m-%d")):
+                day_low_change_pct=_quote_day_low_pct(data),
+            )))
+        if not samples:
+            return
+        quote_days = {day for day, _sample in samples}
+        if len(quote_days) != 1:
+            self.log(f"下探回升行情日期不一致: {sorted(quote_days)}，本轮跳过", "WARNING")
+            return
+        quote_day = next(iter(quote_days))
+        for alert in self._dip_rebound_engine.update(
+            [sample for _day, sample in samples], quote_day,
+        ):
             try:
                 self._notify(
                     alert.title,
@@ -7539,6 +7665,123 @@ class StockMenuBar(rumps.App):
                 self.log(f"下探回升提醒(阶段{alert.stage}): {alert.title}", "INFO")
             except Exception as error:
                 self.log(f"下探回升提醒发送失败: {error}", "WARNING")
+
+    def _iter_holding_ticks(self):
+        """持仓行情 → (name, data)；无行情的跳过。只扫持仓，不扫观察池。"""
+        position_codes = {p.get("code") for p in self.portfolio.get("positions", [])}
+        for code in position_codes:
+            data = self.stock_data.get(code)
+            if not data or data.get("price") is None:
+                continue
+            yield code, self._display_stock_name(code, data.get("name")), data
+
+    def _check_seal_events(self):
+        """持仓封板/炸板/回封事件：只报事实，不带买卖指令。
+
+        2026-10-22 华天科技 14:00 封板、15:00 尾盘炸板全程零提醒——
+        封板类事件此前只有板块龙头在管。判定复用龙头封板口径（贴涨停价
+        且卖一为空）。
+        """
+        if not hasattr(self, "_seal_tracker"):
+            self._seal_tracker = self._restore_tracker_state(
+                "seal_events", SealEventTracker(),
+            )
+        for code, name, data in self._iter_holding_ticks():
+            try:
+                clock = parse_quote_clock(data)
+                if clock is None:
+                    continue
+                tick = SealTick(
+                    code=code,
+                    name=name,
+                    price=float(data.get("price") or 0),
+                    prev_close=float(data.get("prev_close") or 0),
+                    ask1_price=self._safe_float(data.get("ask1_price"), None),
+                    ask1_vol=self._safe_float(data.get("ask1_vol"), None),
+                    bid1_vol=float(data.get("bid1_vol") or 0),
+                )
+                for event in self._seal_tracker.update(tick, clock.day):
+                    self._notify_seal_event(event)
+            except Exception as error:
+                self.log(f"封板事件检测失败 {name}: {error}", "WARNING")
+
+    def _notify_seal_event(self, event):
+        """封板/炸板/回封通知：事实 + 盘口快照，无处置指令。"""
+        limit_text = f"{event.limit_price:.2f}"
+        if event.kind == "封板":
+            title = f"🔔 {event.name} 封板"
+            body = (
+                f"封死涨停 {limit_text}，封单 {event.seal_volume / 10000:.0f} 万股。"
+                "炸板会再提醒。"
+            )
+        elif event.kind == "回封":
+            title = f"🔔 {event.name} 回封"
+            body = (
+                f"重新封死涨停 {limit_text}，封单 {event.seal_volume / 10000:.0f} 万股。"
+                f"当日已炸板 {event.blowout_count} 次。"
+            )
+        else:
+            title = f"💥 {event.name} 炸板"
+            body = (
+                f"涨停打开，现价 {event.price:.2f}。"
+                f"当日第 {event.blowout_count} 次炸板；若回封会再提醒。"
+            )
+        try:
+            self._notify(title, "封板事件", body, level="info")
+            self.log(f"封板事件: {title} - {body}", "INFO")
+        except Exception as error:
+            self.log(f"封板事件通知失败: {error}", "WARNING")
+
+    def _check_ignition(self):
+        """持仓盘中点火：短窗量能突增 + 突破整理平台上沿 → 强提醒弹窗。
+
+        2026-10-22 华天科技 13:50–13:55 量能 4 倍、破平台 14.06，约 5 分钟后
+        封板——这是封板前盘面唯一硬线索。回测显示突破信号跑输无条件买入，
+        所以只提示异动事实，不给买卖指令。
+        """
+        if not hasattr(self, "_ignition_tracker"):
+            self._ignition_tracker = self._restore_tracker_state(
+                "ignition", IgnitionTracker(),
+            )
+        for code, name, data in self._iter_holding_ticks():
+            try:
+                clock = parse_quote_clock(data)
+                if clock is None:
+                    continue
+                sample = IgnitionSample(
+                    code=code,
+                    name=name,
+                    price=float(data.get("price") or 0),
+                    cumulative_volume=float(data.get("volume") or 0),
+                    timestamp=clock.at.timestamp(),
+                )
+                alert = self._ignition_tracker.update(sample, clock.day)
+                if alert is not None:
+                    self._notify_ignition(alert)
+            except Exception as error:
+                self.log(f"盘中点火检测失败 {name}: {error}", "WARNING")
+
+    def _notify_ignition(self, alert):
+        """盘中点火强提醒：通知 + 弹窗双通道（用户明确要求弹窗）。"""
+        body = (
+            f"5 分钟量能约为前 30 分钟均量的 {alert.volume_ratio:.1f} 倍，"
+            f"现价 {alert.price:.2f} 突破整理平台上沿 {alert.platform_top:.2f}。"
+            "盘面异动事实，非买入指令。"
+        )
+        title = f"🔥 {alert.name} 盘中点火"
+        try:
+            self._notify(title, f"现价 {alert.price:.2f}", body, level="warning")
+            self.log(f"盘中点火: {title} - {body}", "INFO")
+        except Exception as error:
+            self.log(f"盘中点火通知失败: {error}", "WARNING")
+        # 强提醒弹窗：走告警对话框，强制弹出（不理会冷却——点火是罕见事件，
+        # 每只每天最多一次，由 tracker 保证不刷屏）。
+        try:
+            self._show_alert_dialog(
+                title, f"现价 {alert.price:.2f}", body, "warning",
+            )
+        except Exception as error:
+            self.log(f"盘中点火弹窗失败: {error}", "WARNING")
 
     @staticmethod
     def _intraday_policy_intent(signal):
@@ -7892,10 +8135,6 @@ class StockMenuBar(rumps.App):
                     (price < ma20 * (1 - 0.02) or closes_below_ma20 >= 2)
                 ),
             }
-            self._signal_confidence.record_tick(
-                code, price, change_pct, vr, conditions
-            )
-
             # ── 更新之前信号的结果 ──
             from intraday_tactics import IntradaySignalType
             for signal_type in IntradaySignalType:
@@ -7921,6 +8160,16 @@ class StockMenuBar(rumps.App):
                 **market_context["values"],
                 **deep_context,
             )
+            if potential_signal is not None:
+                conditions[potential_signal.signal_type.value] = True
+            self._signal_confidence.record_tick(
+                code, price, change_pct, vr, conditions
+            )
+            repeat_guard = getattr(self, "_intraday_repeat_guard", None)
+            if repeat_guard is None:
+                repeat_guard = self._intraday_repeat_guard = AlertRepeatGuard()
+            if potential_signal is None:
+                repeat_guard.clear(code)
 
             confirmation_rounds = 2  # 默认2轮
             if potential_signal and potential_signal.signal_type not in {
@@ -7957,6 +8206,10 @@ class StockMenuBar(rumps.App):
             )
 
             if signal:
+                candidate_signal_type = signal.signal_type
+                self._signal_confidence.record_signal_trigger(
+                    code, candidate_signal_type, price
+                )
                 buy_capacity_quantity = suggested_add_quantity(
                     price=price,
                     holding_quantity=quantity,
@@ -7973,6 +8226,16 @@ class StockMenuBar(rumps.App):
                     trend=entry.get("trend_assessment"),
                     high_position=entry.get("high_position"),
                 )
+                notification_body = signal.notification_body or signal.body
+                if signal.signal_type == IntradaySignalType.TRADE_WAIT:
+                    self._intraday_tactics.release_signal_attempt(
+                        code, candidate_signal_type
+                    )
+                    signature = (candidate_signal_type.value, notification_body)
+                    if not repeat_guard.accept(code, signature):
+                        continue
+                else:
+                    repeat_guard.clear(code)
                 if signal.signal_type in {
                     IntradaySignalType.T_HOLD,
                     IntradaySignalType.T_HOLD_CAUTION,
@@ -8026,16 +8289,10 @@ class StockMenuBar(rumps.App):
                 _, flow_note, flow_level = self._capital_flow_signal_context(
                     code, signal.signal_type.value
                 )
-                notification_body = signal.notification_body or signal.body
                 if flow_note:
                     signal.body = f"{signal.body}\n{flow_note}"
                     if flow_level == "danger":
                         notification_body += "｜资金确认风险"
-                # 记录信号触发
-                self._signal_confidence.record_signal_trigger(
-                    code, signal.signal_type, price
-                )
-
                 # 发送通知
                 try:
                     self._notify(
@@ -8300,12 +8557,13 @@ class StockMenuBar(rumps.App):
         # 行情留一份给菜单显示涨跌幅（每轮都是最新的）
         self._leader_quote_cache = quotes
 
-        now = time.time()
-        day = datetime.now().strftime("%Y-%m-%d")
         events = []
         for code in codes:
             row = quotes.get(code)
             if not row:
+                continue
+            clock = parse_quote_clock(row)
+            if clock is None:
                 continue
             tick = LeaderTick(
                 code=code,
@@ -8318,7 +8576,9 @@ class StockMenuBar(rumps.App):
                 volume=float(row.get("volume") or 0),
             )
             try:
-                events.extend(self._leader_guard.update(tick, now=now, day=day))
+                events.extend(self._leader_guard.update(
+                    tick, now=clock.at.timestamp(), day=clock.day,
+                ))
             except Exception as error:
                 self.log(f"龙头状态机出错 {code}: {error}", "WARNING")
 
@@ -8765,6 +9025,16 @@ class StockMenuBar(rumps.App):
             addition_assessment.get("data_date")
             or self._addition_data_date(evaluations)
         )
+        # 七、近两日利好/利空：独立兜底，任何失败只丢这一节、不伤报告主体。
+        news_impact = None
+        try:
+            if getattr(self, "_news_impact_service", None) is None:
+                self._news_impact_service = NewsImpactService(self.log_dir, log=self.log)
+            news_impact = self._news_impact_service.get_impacts(
+                positions, quote_date, final_refresh=(mode == "finalize"),
+            )
+        except Exception as error:
+            self.log(f"近两日利好利空汇总失败: {error}", "WARNING")
         text = format_daily_report(
             overview,
             results,
@@ -8772,6 +9042,7 @@ class StockMenuBar(rumps.App):
             meta,
             addition=addition,
             evaluations=evaluations,
+            news_impact=news_impact,
         )
 
         temp_path = None
