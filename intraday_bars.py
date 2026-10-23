@@ -162,10 +162,15 @@ def build_timeframe_evidence(
 ) -> TimeframeEvidence:
     bars15 = list(bars15 or [])
     bars30 = list(bars30 or [])
+    quote_day = str(quote_date or "")[:10]
+    current_day_bars15 = [
+        bar for bar in bars15
+        if quote_day and str(bar.get("timestamp", ""))[:10] == quote_day
+    ]
     breakout = resistance > 0 and price >= resistance
     threshold = resistance if breakout else support
     confirmations = (
-        _trailing_confirmations(bars15, threshold, breakout)
+        _trailing_confirmations(current_day_bars15, threshold, breakout)
         if threshold > 0
         else 0
     )
@@ -197,7 +202,7 @@ def build_timeframe_evidence(
         and bars15[-1]["close"] < risk_price_threshold
     )
     risk_confirmations = _risk_confirmations(
-        bars15, price, risk_price_threshold
+        current_day_bars15, price, risk_price_threshold
     ) if risk_confirmed else 0
     risk_level = _historical_risk_level(
         price, historical_context or {}

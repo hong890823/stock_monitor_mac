@@ -7514,6 +7514,7 @@ class StockMenuBar(rumps.App):
                 intent, decision.message, eligibility, evidence,
                 trade_date=trade_date, invalidation_price=invalidation,
                 max_quantity=decision.max_sell_quantity,
+                volume_context=volume_context,
             )
             tactics = getattr(self, "_intraday_tactics", None)
             if tactics is not None:
@@ -7533,6 +7534,7 @@ class StockMenuBar(rumps.App):
                 intent, decision.message, eligibility, evidence,
                 trade_date=trade_date, invalidation_price=invalidation,
                 max_quantity=decision.max_sell_quantity,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=IntradaySignalType.NEXT_DAY_REVIEW,
@@ -7544,73 +7546,63 @@ class StockMenuBar(rumps.App):
             guarded = guard_actionable_copy(
                 "buy", decision.message, eligibility, evidence,
                 trade_date=trade_date, invalidation_price=invalidation,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=signal.signal_type,
                 title=f"📗 {name} 确认买入窗口",
                 body=guarded.text,
-                notification_body=(
-                    f"15/30确认｜小仓买{decision.max_buy_quantity}股"
-                    f"｜跌破{decision.invalidation_price:.2f}停止"
-                ),
+                notification_body=guarded.text,
             )
         if decision.action == DecisionAction.RISK_EXIT:
             guarded = guard_actionable_copy(
                 "risk_exit", decision.message, eligibility, evidence,
                 trade_date=trade_date,
                 max_quantity=decision.max_sell_quantity,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=signal.signal_type,
                 title=f"🔴 {name} 风险离场",
                 body=guarded.text,
-                notification_body=(
-                    f"15分钟风险确认｜今日可卖{decision.max_sell_quantity}股"
-                    "｜新仓T+1不纳入"
-                ),
+                notification_body=guarded.text,
             )
         if decision.action == DecisionAction.RISK_REDUCE:
             guarded = guard_actionable_copy(
                 "risk_reduce", decision.message, eligibility, evidence,
                 trade_date=trade_date,
                 max_quantity=decision.max_sell_quantity,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=IntradaySignalType.EXIT_WINDOW,
                 title=f"🟠 {name} 分批减仓观察",
                 body=guarded.text,
-                notification_body=(
-                    f"连续15分钟风险确认｜首批最多减{decision.max_sell_quantity}股"
-                    "｜新仓T+1不纳入"
-                ),
+                notification_body=guarded.text,
             )
         if decision.action == DecisionAction.NORMAL_EXIT:
             guarded = guard_actionable_copy(
                 "normal_exit", decision.message, eligibility, evidence,
                 trade_date=trade_date,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=IntradaySignalType.EXIT_WINDOW,
                 title=f"🔴 {name} 分批卖出窗口",
                 body=guarded.text,
-                notification_body=(
-                    f"15/30确认｜原有可卖{decision.max_sell_quantity}股"
-                    "｜新仓T+1"
-                ),
+                notification_body=guarded.text,
             )
         if decision.action == DecisionAction.T_SELL:
             guarded = guard_actionable_copy(
                 "t_sell", decision.message, eligibility, evidence,
                 trade_date=trade_date,
+                volume_context=volume_context,
             )
             return IntradaySignal(
                 signal_type=IntradaySignalType.T_SELL,
                 title=f"🔥 {name} 做T减仓窗口",
                 body=guarded.text,
-                notification_body=(
-                    f"15/30确认｜原有可卖最多{decision.max_sell_quantity}股"
-                    "｜新仓T+1"
-                ),
+                notification_body=guarded.text,
             )
         return signal
 

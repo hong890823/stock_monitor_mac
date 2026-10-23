@@ -66,6 +66,20 @@ class IntradayVolumeContextTest(unittest.TestCase):
 
         self.assertFalse(context.absorption_confirmed)
 
+    def test_missing_bar_baseline_does_not_fall_back_to_cumulative_volume(self):
+        context = build_intraday_volume_context(
+            stock_volume_ratio=2.0,
+            bars15=[
+                {**bar("2026-10-23 09:30:00", 16.0, 16.1, 15.2, 15.3), "volume": 0},
+                {**bar("2026-10-23 09:45:00", 15.3, 15.4, 14.5, 15.2), "volume": 200},
+            ],
+            price=15.1,
+            support=15.3,
+        )
+
+        self.assertIs(context.bar_volume_confirming, False)
+        self.assertFalse(context.absorption_confirmed)
+
 
 if __name__ == "__main__":
     unittest.main()

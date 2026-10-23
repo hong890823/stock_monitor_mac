@@ -60,6 +60,10 @@ class AllIntradayActionSurfacesTest(unittest.TestCase):
             evidence(),
             trade_date="2026-10-20",
             invalidation_price=12.0,
+            volume_context={
+                "stock_volume_confirming": True,
+                "market_expanding": True,
+            },
         )
 
         self.assertEqual(guarded.level, "actionable")

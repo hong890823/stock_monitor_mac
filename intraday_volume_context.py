@@ -75,17 +75,15 @@ def build_intraday_volume_context(
             if previous_volumes:
                 bar_ratio = float(last["volume"]) / median(previous_volumes)
                 bar_confirming = bar_ratio >= 1.3
+            else:
+                bar_confirming = False
             bar_range = high - low
             midpoint = (high + low) / 2
             current_price = _float(price)
             support_value = _float(support)
             lower_shadow = min(open_price, close) - low
             upper_shadow = high - max(open_price, close)
-            volume_hint = (
-                bool(bar_confirming)
-                if bar_confirming is not None
-                else bool(stock_confirming or market_expanding)
-            )
+            volume_hint = bool(bar_confirming)
             absorption = bool(
                 support_value is not None
                 and current_price is not None
@@ -102,11 +100,7 @@ def build_intraday_volume_context(
                 change_value is not None
                 and change_value > 0
                 and stock_ratio is not None
-                and (
-                    bool(bar_confirming)
-                    if bar_confirming is not None
-                    else stock_ratio >= 1.5
-                )
+                and bool(bar_confirming)
                 and bar_range > 0
                 and upper_shadow / bar_range >= 0.5
                 and close < midpoint

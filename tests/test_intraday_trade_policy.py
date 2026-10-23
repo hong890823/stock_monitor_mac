@@ -36,10 +36,25 @@ class IntradayTradePolicyTest(unittest.TestCase):
             evidence(),
             PositionEligibility(total_quantity=500, sellable_quantity=500, buy_capacity_quantity=100),
             invalidation_price=12.0,
+            volume_context={
+                "stock_volume_confirming": True,
+                "market_expanding": True,
+            },
         )
 
         self.assertEqual(decision.action, DecisionAction.BUY_SMALL)
         self.assertIn("15/30分钟", decision.message)
+
+    def test_missing_volume_context_blocks_buy(self):
+        decision = evaluate_trade_action(
+            "buy",
+            evidence(),
+            PositionEligibility(total_quantity=500, sellable_quantity=500, buy_capacity_quantity=100),
+            invalidation_price=12.0,
+        )
+
+        self.assertEqual(decision.action, DecisionAction.WAIT)
+        self.assertIn("量能证据不足", decision.message)
 
     def test_unconfirmed_buy_is_observation_only(self):
         decision = evaluate_trade_action(
@@ -134,6 +149,38 @@ class IntradayTradePolicyTest(unittest.TestCase):
 
         self.assertEqual(decision.action, DecisionAction.WAIT)
         self.assertIn("量能证据不足", decision.message)
+
+    def test_guard_blocks_actionable_buy_without_volume_context(self):
+        guarded = guard_actionable_copy(
+            "buy",
+            "小仓买入",
+            eligibility=PositionEligibility(
+                total_quantity=500,
+                sellable_quantity=500,
+                buy_capacity_quantity=100,
+            ),
+            evidence=evidence(),
+            trade_date="2026-10-20",
+            invalidation_price=12.0,
+        )
+
+        self.assertEqual(guarded.level, "observation")
+        self.assertIn("量能", guarded.text)
+
+    def test_guard_blocks_normal_risk_reduction_before_third_bar(self):
+        guarded = guard_actionable_copy(
+            "risk_reduce",
+            "首批减仓",
+            eligibility=PositionEligibility(total_quantity=500, sellable_quantity=500),
+            evidence=evidence(
+                risk=True,
+                risk_confirmations=2,
+                risk_level="NORMAL",
+            ),
+            trade_date="2026-10-20",
+        )
+
+        self.assertEqual(guarded.level, "risk_fact")
 
 
 if __name__ == "__main__":

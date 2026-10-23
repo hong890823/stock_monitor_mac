@@ -103,13 +103,9 @@ def evaluate_trade_action(
             return _wait("15分钟K线出现明显上影拒绝，仅观察，不执行买入。")
         if bool(_value(volume_context, "blowoff_risk", False)):
             return _wait("上涨放量但出现冲高回落迹象，量价证据冲突，仅观察，不执行买入。")
-        if volume_context is not None and _value(
-            volume_context, "stock_volume_confirming", None
-        ) is not True:
+        if _value(volume_context, "stock_volume_confirming", None) is not True:
             return _wait("个股量能证据不足，仅观察，不执行买入。")
-        if volume_context is not None and _value(
-            volume_context, "market_expanding", None
-        ) is not True:
+        if _value(volume_context, "market_expanding", None) is not True:
             return _wait("两市成交量证据不足或未放大，仅观察，不执行买入。")
         if not evidence.complete or evidence.m15_confirmations < 2 or not evidence.m30_aligned:
             return _wait("15/30分钟条件未完整确认，仅观察，不执行买入。")

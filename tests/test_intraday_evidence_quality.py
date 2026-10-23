@@ -53,6 +53,10 @@ class IntradayEvidenceQualityTest(unittest.TestCase):
     def test_actionable_buy_keeps_03_percent_clearance(self):
         decision = evaluate_trade_action(
             "buy", evidence(), self.eligibility, 12.0,
+            volume_context={
+                "stock_volume_confirming": True,
+                "market_expanding": True,
+            },
         )
 
         self.assertEqual(decision.action, DecisionAction.BUY_SMALL)
@@ -109,6 +113,43 @@ class IntradayEvidenceQualityTest(unittest.TestCase):
         self.assertTrue(result.clearance_confirmed)
         self.assertTrue(result.last_bar_rejected)
         self.assertGreaterEqual(result.m15_distance_pct, 0.003)
+
+    def test_buy_confirmations_do_not_cross_trade_days(self):
+        bars15 = [
+            {"timestamp": "2026-10-19 14:45:00", "open": 12.0, "high": 12.1, "low": 11.9, "close": 12.05, "volume": 100},
+            {"timestamp": "2026-10-19 15:00:00", "open": 12.05, "high": 12.1, "low": 11.9, "close": 12.05, "volume": 100},
+            {"timestamp": "2026-10-20 10:30:00", "open": 12.05, "high": 12.1, "low": 11.9, "close": 12.05, "volume": 100},
+        ]
+        bars30 = [
+            {"timestamp": "2026-10-20 10:00:00", "open": 12.0, "high": 12.1, "low": 11.9, "close": 12.05, "volume": 100},
+            {"timestamp": "2026-10-20 10:30:00", "open": 12.05, "high": 12.1, "low": 11.9, "close": 12.05, "volume": 100},
+        ]
+
+        result = build_timeframe_evidence(
+            bars15, bars30,
+            price=12.05, support=12.0, resistance=13.0,
+            now=datetime(2026, 10, 20, 10, 31),
+            quote_date="2026-10-20",
+        )
+
+        self.assertEqual(result.m15_confirmations, 1)
+
+    def test_risk_confirmations_do_not_cross_trade_days(self):
+        bars15 = [
+            {"timestamp": "2026-10-19 14:45:00", "open": 11.9, "high": 11.9, "low": 11.7, "close": 11.8, "volume": 100},
+            {"timestamp": "2026-10-19 15:00:00", "open": 11.8, "high": 11.8, "low": 11.7, "close": 11.75, "volume": 100},
+            {"timestamp": "2026-10-20 10:30:00", "open": 11.75, "high": 11.8, "low": 11.6, "close": 11.7, "volume": 100},
+        ]
+
+        result = build_timeframe_evidence(
+            bars15, [],
+            price=11.7, support=12.0, resistance=13.0,
+            now=datetime(2026, 10, 20, 10, 31),
+            quote_date="2026-10-20",
+        )
+
+        self.assertTrue(result.risk_complete)
+        self.assertEqual(result.risk_confirmations, 1)
 
 
 if __name__ == "__main__":

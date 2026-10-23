@@ -79,6 +79,38 @@ class IntradayTradeIntegrationTest(unittest.TestCase):
             "sz000737", IntradaySignalType.T_BUY, retry_after_seconds=600
         )
 
+    def test_confirmed_buy_forwards_volume_context_to_action_guard(self):
+        bars15 = [
+            bar("2026-10-20 10:30:00", 12.1),
+            bar("2026-10-20 10:45:00", 12.1),
+        ]
+        bars30 = [
+            bar("2026-10-20 10:00:00", 12.1),
+            bar("2026-10-20 10:30:00", 12.1),
+        ]
+        app = subject(bars15, bars30, FakeLedger())
+        signal = IntradaySignal(
+            IntradaySignalType.T_BUY,
+            "📗 北方铜业 回踩接回",
+            "站回支撑后可小仓补。",
+            "小仓补",
+        )
+
+        result = app._apply_intraday_trade_policy(
+            signal, "sz000737", "北方铜业", 12.1, 12.0, 13.0,
+            now=self.now, buy_capacity_quantity=100,
+            trade_date="2026-10-20",
+            volume_inputs={
+                "market_turnover": 130,
+                "recent_market_turnovers": [100, 100, 100],
+                "stock_volume_ratio": 1.5,
+                "price_change_pct": 2.0,
+            },
+        )
+
+        self.assertNotIn("仅观察", result.body)
+        self.assertIn("小仓买", result.notification_body)
+
     def test_today_bought_only_risk_signal_cannot_sell_today(self):
         app = subject(
             [

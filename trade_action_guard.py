@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Optional
@@ -85,6 +86,14 @@ def _eligibility_value(eligibility: Any, name: str, default=0):
     return getattr(eligibility, name, default) if eligibility is not None else default
 
 
+def _volume_value(volume_context: Any, name: str, default=None):
+    if volume_context is None:
+        return default
+    if isinstance(volume_context, Mapping):
+        return volume_context.get(name, default)
+    return getattr(volume_context, name, default)
+
+
 def action_kind_for_signal(signal_type: Any, text: Any = "") -> str:
     signal_text = f"{signal_type or ''} {text or ''}"
     if any(phrase in signal_text for phrase in ("跌破支撑", "破位", "离场风险", "风险离场")):
@@ -106,6 +115,7 @@ def guard_intraday_signal(
     trade_date: Optional[str] = None,
     invalidation_price: float = 0.0,
     max_quantity: int = 0,
+    volume_context: Any = None,
 ) -> GuardedCopy:
     kind = action_kind_for_signal(signal_type, text)
     if kind == "risk_exit" and evidence is not None:
@@ -125,6 +135,7 @@ def guard_intraday_signal(
         trade_date=trade_date,
         invalidation_price=invalidation_price,
         max_quantity=max_quantity,
+        volume_context=volume_context,
     )
 
 
@@ -136,6 +147,7 @@ def guard_actionable_copy(
     trade_date: Optional[str] = None,
     invalidation_price: float = 0.0,
     max_quantity: int = 0,
+    volume_context: Any = None,
 ) -> GuardedCopy:
     kind = str(kind or "").lower().strip()
     text = str(text or "").strip()
@@ -153,6 +165,21 @@ def guard_actionable_copy(
             or float(invalidation_price or 0.0) <= 0
         ):
             return GuardedCopy("observation", "仅观察：15/30分钟条件未达到稳健买点，不执行买入或补仓。", reason="买入证据不足")
+        if bool(_volume_value(volume_context, "blowoff_risk", False)):
+            return GuardedCopy(
+                "observation",
+                "仅观察：上涨放量出现冲高回落迹象，量价证据冲突，不执行买入或补仓。",
+                reason="冲高回落风险",
+            )
+        if (
+            _volume_value(volume_context, "stock_volume_confirming") is not True
+            or _volume_value(volume_context, "market_expanding") is not True
+        ):
+            return GuardedCopy(
+                "observation",
+                "仅观察：个股或两市量能证据不足，不执行买入或补仓。",
+                reason="量能证据不足",
+            )
         quantity = (int(_eligibility_value(eligibility, "buy_capacity_quantity")) // 100) * 100
         if quantity < 100:
             return GuardedCopy("observation", "仅观察：仓位边界不允许至少一手，不执行买入或补仓。", reason="仓位不足")
@@ -169,11 +196,16 @@ def guard_actionable_copy(
     if kind in {"risk_exit", "risk_reduce", "stop", "break_support"}:
         risk_confirmations = int(_evidence_value(evidence, "risk_confirmations", 0))
         critical = bool(_evidence_value(evidence, "risk_level", "NORMAL") == "CRITICAL")
+        risk_confirmations_ready = (
+            risk_confirmations >= 3
+            if bool(_evidence_value(evidence, "risk_level", "NORMAL") == "NORMAL")
+            else risk_confirmations >= 2
+        )
         risk_ready = bool(
             _valid_trade_date(trade_date)
             and _evidence_value(evidence, "risk_complete")
             and _evidence_value(evidence, "risk_confirmed")
-            and risk_confirmations >= 2
+            and risk_confirmations_ready
         )
         full_exit_ready = bool(
             kind == "risk_exit" and critical and risk_confirmations >= 3
