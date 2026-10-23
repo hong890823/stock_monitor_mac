@@ -108,20 +108,21 @@ class EntryReviewIntegrationTests(unittest.TestCase):
 
     def test_menu_controls_are_clickable_and_pause_preserves_original_actions(self):
         service = self.attach()
-        self.app._menu = {"📈 指标策略": _FakeMenuItem("📈 指标策略")}
+        self.app._menu = {"📈 选股": _FakeMenuItem("📈 选股")}
         self.app._observation_last_error = None
         self.app.indicator_menu_titles = lambda: ["原有选股结果"]
         with patch("stock_menubar.rumps", _FakeRumps):
-            self.app.update_indicator_menu()
-            parent = self.app.menu["📈 指标策略"]
-            pool = next(child for child in parent.children if getattr(child, "title", "") == "🔎 持续观察池")
-            actions = {child.title: child.callback for child in pool.children}
+            self.app.update_selection_menu()
+            parent = self.app.menu["📈 选股"]
+            actions = {child.title: child.callback for child in parent.children if isinstance(child, _FakeMenuItem)}
             self.assertTrue(callable(actions["📒 查看买点复盘报告"]))
             actions["⏸ 暂停买点复盘（选股提醒继续）"](None)
             self.assertFalse(service.enabled)
             self.assertEqual(parent.children[-1].title, "原有选股结果")
-            pool = next(child for child in parent.children if getattr(child, "title", "") == "🔎 持续观察池")
-            self.assertTrue(any(child.title == "▶ 恢复买点复盘" for child in pool.children))
+            self.assertTrue(any(
+                getattr(child, "title", "") == "▶ 恢复买点复盘"
+                for child in parent.children
+            ))
 
 
 if __name__ == "__main__":

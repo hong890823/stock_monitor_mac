@@ -26,7 +26,7 @@ def _bars(end="2026-10-14", kind="pullback"):
                      "low": close - 0.3, "close": close,
                      "volume": 60 if kind == "pullback" and index >= 60 else 100})
     if kind == "weak":
-        for bar in bars[-2:]:
+        for bar in bars[-3:]:
             bar.update(open=8, close=8, low=7.8, high=8.2)
     return bars
 
@@ -161,16 +161,15 @@ class ObservationPoolTests(unittest.TestCase):
     def test_terminal_record_requires_five_new_bars_and_a_fresh_hit_to_reenter(self):
         pool = ObservationPool()
         self.review(pool, "2026-10-12", "neutral", hits=[_hit()])
-        self.review(pool, "2026-10-16", "neutral")
-        self.review(pool, "2026-10-16", hits=[_hit("strict")])
-        self.assertEqual(pool.records["sh600001"]["status"], "expired")
+        record = pool.records["sh600001"]
+        record.update(status="eliminated", state="ELIMINATED", closed_date="2026-10-13")
         self.review(pool, "2026-10-19", hits=[_hit("strict")])
-        self.assertEqual(pool.records["sh600001"]["status"], "expired")
+        self.assertEqual(pool.records["sh600001"]["status"], "eliminated")
         self.review(pool, "2026-10-23", hits=[_hit("strict")])
         record = pool.records["sh600001"]
         self.assertEqual(record["status"], "observing")
         self.assertEqual(record["observation_days"], 1)
-        self.assertEqual(record["previous_rounds"][0]["status"], "expired")
+        self.assertEqual(record["previous_rounds"][0]["status"], "eliminated")
 
     def test_report_contains_daily_decisions_and_prices(self):
         pool = ObservationPool()
@@ -182,23 +181,24 @@ class ObservationPoolTests(unittest.TestCase):
         self.assertIn("2026-10-14", report)
         self.assertIn("首个完整交易日", report)
 
-    def test_two_complete_weak_days_eliminate_and_keep_reason(self):
+    def test_three_complete_weak_days_eliminate_and_keep_reason(self):
         pool = ObservationPool()
         self.review(pool, "2026-10-13", "weak", hits=[_hit()])
         self.review(pool, "2026-10-14", "weak")
+        self.review(pool, "2026-10-15", "weak")
         record = pool.records["sh600001"]
         self.assertEqual(record["status"], "eliminated")
         self.assertIn("趋势", record["reason"])
         self.assertIn("淘汰", "\n".join(pool.menu_lines()))
 
-    def test_five_unconfirmed_bars_expire_even_if_original_rule_still_hits(self):
+    def test_ten_unconfirmed_bars_eliminate_even_if_original_rule_still_hits(self):
         pool = ObservationPool()
         self.review(pool, "2026-10-12", "neutral", hits=[_hit("strict")])
-        self.review(pool, "2026-10-16", "neutral", hits=[_hit("strict")])
+        self.review(pool, "2026-10-23", "neutral", hits=[_hit("strict")])
         record = pool.records["sh600001"]
-        self.assertEqual(record["observation_days"], 5)
-        self.assertEqual(record["status"], "expired")
-        self.assertIn("5", record["reason"])
+        self.assertEqual(record["observation_days"], 10)
+        self.assertEqual(record["status"], "eliminated")
+        self.assertIn("10", record["reason"])
 
     def test_ready_record_is_downgraded_when_structure_disappears(self):
         pool = ObservationPool()

@@ -5,13 +5,18 @@ from intraday_bars import TimeframeEvidence, build_timeframe_evidence
 from intraday_trade_policy import DecisionAction, PositionEligibility, evaluate_trade_action
 
 
-def evidence(*, m15=2, aligned=True, clearance=True, rejected=False, risk=False):
+def evidence(
+    *, m15=2, aligned=True, clearance=True, rejected=False, risk=False,
+    risk_confirmations=3, risk_level="CRITICAL",
+):
     return TimeframeEvidence(
         m15_confirmations=m15,
         m30_aligned=aligned,
         risk_confirmed=risk,
         complete=True,
         risk_complete=True,
+        risk_confirmations=risk_confirmations if risk else 0,
+        risk_level=risk_level if risk else "NORMAL",
         last_completed_15m="2026-10-20 10:30:00",
         last_completed_30m="2026-10-20 10:30:00",
         m15_distance_pct=0.004 if clearance else 0.001,
@@ -52,15 +57,18 @@ class IntradayEvidenceQualityTest(unittest.TestCase):
 
         self.assertEqual(decision.action, DecisionAction.BUY_SMALL)
 
-    def test_risk_exit_still_uses_single_15m_bar(self):
+    def test_single_15m_risk_bar_waits_for_confirmation(self):
         decision = evaluate_trade_action(
             "risk_exit",
-            evidence(m15=1, aligned=False, risk=True),
+            evidence(
+                m15=1, aligned=False, risk=True,
+                risk_confirmations=1, risk_level="ELEVATED",
+            ),
             PositionEligibility(total_quantity=500, sellable_quantity=500),
             12.0,
         )
 
-        self.assertEqual(decision.action, DecisionAction.RISK_EXIT)
+        self.assertEqual(decision.action, DecisionAction.WAIT)
 
     def test_bar_evidence_marks_clearance_and_rejection(self):
         bars15 = [

@@ -32,9 +32,9 @@ docs/
 
 | 策略 | 文档 | 代码模块 | 测试 | 菜单位置 |
 |---|---|---|---|---|
-| 513 低位形态 | `strategies/513低位选股策略.md` | `five_one_three.py` | `tests/test_five_one_three.py` | 📈 指标策略 → 513形态 |
-| 选股持续观察池与买点提醒 | `strategies/选股持续观察池.md` | `observation_pool.py`、`observation_alerts.py`、`observation_ui.py`、`stock_menubar.py` | `tests/test_observation_pool.py`、`tests/test_observation_integration.py`、`tests/test_observation_alerts.py`、`tests/test_observation_alert_integration.py`、`tests/test_observation_ui.py`、`tests/test_observation_ui_integration.py` | 📈 指标策略顶部买点 / 🔎 持续观察池 / 浮窗 / 系统通知 |
-| 买点事件账本与模拟复盘 | `strategies/买点事件账本与模拟复盘.md` | `entry_review.py`、`entry_review_store.py`、`entry_review_service.py` | `tests/test_entry_review.py`、`tests/test_entry_review_store.py`、`tests/test_entry_review_service.py`、`tests/test_entry_review_integration.py` | 📈 指标策略 → 🔎 持续观察池 → 📒 查看买点复盘报告 |
+| 513 低位形态 | `strategies/513低位选股策略.md` | `five_one_three.py` | `tests/test_five_one_three.py` | 选股 → 513形态 |
+| 选股持续观察池与买点提醒 | `strategies/选股持续观察池.md` | `observation_pool.py`、`observation_alerts.py`、`observation_ui.py`、`selection_menu.py`、`stock_menubar.py` | `tests/test_observation_pool.py`、`tests/test_observation_integration.py`、`tests/test_observation_alerts.py`、`tests/test_observation_alert_integration.py`、`tests/test_observation_ui.py`、`tests/test_observation_ui_integration.py`、`tests/test_selection_menu.py`、`tests/test_selection_menu_ui.py` | 选股平铺状态与历史提醒 / 右上方替代窗口 / 系统通知 |
+| 买点事件账本与模拟复盘 | `strategies/买点事件账本与模拟复盘.md` | `entry_review.py`、`entry_review_store.py`、`entry_review_service.py` | `tests/test_entry_review.py`、`tests/test_entry_review_store.py`、`tests/test_entry_review_service.py`、`tests/test_entry_review_integration.py` | 选股 → 📒 查看买点复盘报告 |
 | 入场结构与择时 | `strategies/入场结构与择时策略.md` | `entry_structure.py` | `tests/test_entry_structure.py` | 持仓分析报告 |
 | 统一趋势与高位结构决策 | `strategies/统一趋势与高位结构决策.md` | `trend_assessment.py`、`high_position_policy.py`、`portfolio_analysis.py`、`intraday_tactics.py`、`observation_pool.py`、`portfolio_addition.py` | `tests/test_trend_assessment.py`、`tests/test_trade_gate_policy.py`、`tests/test_high_position_policy.py`、`tests/test_intraday_trend_gate_integration.py`、`tests/test_observation_trend_gate.py`、`tests/test_trend_policy_boundaries.py` | 个股分析、持仓报告、盘中提醒、观察池、加仓评估 |
 | 大盘预警 | `strategies/大盘预警策略.md` | `market_alert.py` | `tests/test_market_alert_realert.py`、`tests/test_notify_urgency.py` | 自动检测（无需手动开启） |
@@ -53,7 +53,7 @@ docs/
    - 边界行为（已知会怎么判的特殊情况）
    - 与其他版本/平台的差异表（如对齐 Android 版）
    - 使用与限制（数据源口径、免责声明）
-4. **接入**：菜单区段（如 📈 指标策略 / 新增菜单）+ 漏斗统计（如有）
+4. **接入**：菜单区段（如 选股 / 新增菜单）+ 漏斗统计（如有）
 5. **登记**：`CHANGELOG.md` 一条 + 当日 `CHANGES_YYYY-MM-DD.md` 归档（根因/验证/经验）
 6. **AI 自动可用**：无需额外步骤 —— `search_project_docs` 检索全部 `.md`/`.py`，
    用户问「XXX策略是什么」时模型会先查这里

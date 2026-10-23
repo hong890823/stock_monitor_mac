@@ -25,17 +25,24 @@ class ObservationUiIntegrationTests(unittest.TestCase):
         self.app._observation_last_error = None
         self.app.indicator_refresh_status = lambda: "测试"
         self.app.indicator_refresh_scheduler = SimpleNamespace(last_success_at=lambda: None, last_error=lambda: None)
-        self.app._menu = {"📈 指标策略": _FakeMenuItem("📈 指标策略")}
+        self.app._menu = {"📈 选股": _FakeMenuItem("📈 选股")}
 
     def titles(self):
         with patch("stock_menubar.datetime") as clock:
             clock.now.return_value = NOW
             return self.app.indicator_menu_titles()
 
+    def selection_titles(self):
+        with patch("stock_menubar.datetime") as clock:
+            clock.now.return_value = NOW
+            return self.app.selection_section_titles()
+
     def test_buy_focus_is_first_even_without_a_current_screen_hit(self):
-        titles = self.titles()
-        self.assertEqual(titles[0], "📋 今日提醒记录 · 1只（非当前买点）")
-        self.assertIn("sh600099", titles[1])
+        titles = self.selection_titles()
+        self.assertEqual(titles[0], "🎯 已晋级 / 买点已确认 · 0只")
+        alert_heading = "📋 今日提醒记录 · 1只（历史记录，非当前买点）"
+        self.assertIn(alert_heading, titles)
+        self.assertIn("sh600099", titles[titles.index(alert_heading) + 1])
 
     def test_buy_point_below_screen_limit_is_promoted_and_decorated(self):
         self.app.indicator_data = [dict(code=f"sh{600000 + index}", name=f"普通{index}", price=10, rsi=20, k=20, d=15) for index in range(35)]
@@ -52,7 +59,6 @@ class ObservationUiIntegrationTests(unittest.TestCase):
         self.app.relaxed_indicator_data = [dict(common, relaxed_score=2, rsi_ok=True)]
         self.app.five_one_three_data = [dict(common, progress="形态已确认", detail="测试形态", gain60=2)]
         titles = self.titles()
-        self.assertEqual(titles[0], "📋 今日提醒记录 · 1只（非当前买点）")
         self.assertEqual(sum(title.startswith("📋【今日曾提醒") for title in titles), 3)
 
     def test_candidate_row_never_uses_confirmed_buy_badge(self):
@@ -60,25 +66,28 @@ class ObservationUiIntegrationTests(unittest.TestCase):
         title = next(title for title in self.titles() if "RSI 20 |" in title)
         self.assertTrue(title.startswith("🟡【日线候选·等待回踩确认】"))
 
-    def test_native_menu_has_buy_points_above_tools_and_pool(self):
+    def test_native_menu_has_buy_points_above_tools_without_nested_pool(self):
         with patch("stock_menubar.datetime") as clock, patch("stock_menubar.rumps", _FakeRumps):
             clock.now.return_value = NOW
-            self.app.update_indicator_menu()
-        children = self.app.menu["📈 指标策略"].children
-        self.assertEqual(children[0].title, "📋 今日提醒记录 · 1只（非当前买点）")
-        self.assertTrue(any(child.title == "🔄 重扫指标（前200，秒级）" for child in children if isinstance(child, _FakeMenuItem)))
-        self.assertEqual(sum(child.title == "📋 今日提醒记录 · 1只（非当前买点）" for child in children if isinstance(child, _FakeMenuItem)), 1)
+            self.app.update_selection_menu()
+        children = self.app.menu["📈 选股"].children
+        self.assertEqual(children[0].title, "🎯 已晋级 / 买点已确认 · 0只")
+        self.assertTrue(any(child.title == "🔄 重扫选股（前200，秒级）" for child in children if isinstance(child, _FakeMenuItem)))
+        self.assertEqual(sum(child.title == "📋 今日提醒记录 · 1只（历史记录，非当前买点）" for child in children if isinstance(child, _FakeMenuItem)), 1)
+        self.assertFalse(any(child.title == "🔎 持续观察池" for child in children if isinstance(child, _FakeMenuItem)))
 
-    def test_floating_window_has_compact_count_and_highlighted_buy_rows(self):
-        self.app.floating_window = Mock()
+    def test_menu_bar_fallback_has_compact_count_and_current_quotes(self):
+        self.app.menu_bar_fallback = Mock()
         self.app._market_turnover_lines = lambda: []
-        self.app._update_floating_window({"indicator": {"items": self.titles(), "buy_count": 1,
-                                                       "title": "📈 指标策略 · 📋 今日曾提醒1"}})
-        text = self.app.floating_window.set_compact.call_args.args[0]
-        self.assertIn("📋 今日曾提醒1只", text)
-        menu = self.app.floating_window.set_menu_data.call_args.args[0]
-        self.assertEqual(menu["indicator"]["items"][1]["color"], "gray")
-        self.assertIn("今日曾提醒1", menu["indicator"]["title"])
+        self.app._update_menu_bar_fallback({
+            "indicator": {"items": self.titles(), "buy_count": 1},
+            "index": {"items": [{"name": "上证", "price": 3000.0, "pct": 1.2}]},
+            "stock": {"items": [{"name": "样本", "price": 10.0, "pct": -0.5}]},
+        })
+        text = self.app.menu_bar_fallback.set_summary.call_args.args[0]
+        self.assertIn("📋 今日曾提醒1", text)
+        self.assertIn("上证 3000.00 ▲1.20%", text)
+        self.assertIn("样本 10.00 ▼0.50%", text)
 
     def test_pool_menu_uses_same_labels_and_removes_today_badge_next_day(self):
         today = self.app.observation_pool.menu_lines(at=NOW)

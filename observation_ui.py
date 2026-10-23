@@ -2,6 +2,7 @@
 
 from datetime import datetime
 import math
+from limit_up_policy import rank_limit_down, rank_limit_up
 
 
 def _today_alert(record, at):
@@ -26,37 +27,104 @@ def _price(value):
         return "--"
 
 
-def build_observation_view(pool, at=None):
+def _state_for(record):
+    state = record.get("state")
+    if state in {"OBSERVING", "NEAR_ENTRY", "BUY_CANDIDATE", "ELIMINATED"}:
+        return state
+    return {
+        "ready": "NEAR_ENTRY",
+        "expired": "ELIMINATED",
+        "eliminated": "ELIMINATED",
+    }.get(record.get("status"), "OBSERVING")
+
+
+def _canonical_destination(strategy):
+    return {
+        "PRE_BREAKOUT": "PRE_BREAKOUT / 启动前潜力",
+        "LEADER": "LEADER / 强势龙头",
+        "LIMIT_UP_CONTINUATION": "LIMIT_UP_CONTINUATION / 涨停持续观察",
+    }.get(strategy, f"{strategy} / 未分类")
+
+
+def _item_for(record, at):
+    state = _state_for(record)
+    strategy = record.get("strategy") or (
+        "LIMIT_UP_CONTINUATION" if "limit" in record.get("sources", [])
+        else "LEADER" if "strong" in record.get("sources", [])
+        else "PRE_BREAKOUT"
+    )
+    destination = record.get("entry_destination") or {
+        "PRE_BREAKOUT": "PRE_BREAKOUT / 启动前潜力",
+        "LEADER": "LEADER / 强势龙头",
+        "LIMIT_UP_CONTINUATION": "LIMIT_UP_CONTINUATION / 涨停持续观察",
+    }[strategy]
+    return {
+        "code": record.get("code"),
+        "name": record.get("name") or record.get("code"),
+        "state": state,
+        "strategy": strategy,
+        "entry_destination": destination,
+        "score": record.get("score", 0),
+        "price": record.get("price"),
+        "stop_price": record.get("stop_price"),
+        "risk_line": record.get("risk_line"),
+        "risk_price": record.get("risk_price"),
+        "flow_window": record.get("flow_window") or [],
+        "structure_evidence": record.get("structure") or record.get("reason"),
+        "risk_evidence": record.get("risk_evidence") or [],
+        "reason": record.get("reason"),
+        "last_reviewed_date": record.get("last_reviewed_date"),
+        "expanded": False,
+    }
+
+
+def build_observation_view(pool, at=None, page=1, expanded=False):
     at = at or datetime.now()
-    view = {"focus_lines": [], "badges": {}, "ranks": {}, "buy_count": 0,
-            "ready_count": 0, "has_pool": pool is not None}
+    view = {
+        "focus_lines": [], "badges": {}, "ranks": {}, "buy_count": 0,
+        "ready_count": 0, "has_pool": pool is not None, "items": [],
+        "groups": {}, "page": max(1, int(page)), "page_count": 1,
+        "expanded": bool(expanded),
+    }
     if pool is None:
         return view
     if getattr(pool, "load_error", None):
         view["focus_lines"] = [f"⚠️ 买点状态不可用：{pool.load_error}"]
         return view
-    buys, ready, withdrawn = [], [], []
+    buys, ready, withdrawn, grouped = [], [], [], {}
     observing = 0
     labels = {"eliminated": "已淘汰", "expired": "观察到期"}
+    active_items = []
     for record in list(pool.records.values()):
         code = record["code"]
         alert = _today_alert(record, at)
-        active = record.get("status") in {"observing", "ready"}
-        reviewed = record.get("data_status") == "已复核"
+        state = _state_for(record)
+        active = state != "ELIMINATED"
+        reviewed = record.get("data_status", "已复核") == "已复核"
+        item = _item_for(record, at)
         if active and reviewed and alert:
             badge, rank = f"📋【今日曾提醒 {alert['at'][11:16]}·非当前买点】", 0
             buys.append((record, alert))
         elif not active or not reviewed:
-            state = labels.get(record.get("status"), "待复核")
-            badge, rank = f"⚠️【{state}】", 3
+            state_label = labels.get(record.get("status"), "待复核")
+            badge, rank = f"⚠️【{state_label}】", 4
             if alert:
-                withdrawn.append(f"⚠️ 今日曾触发 {record['name']}({code})｜现{state}，请重新确认")
-        elif record["status"] == "ready":
-            badge, rank = "🟡【日线候选·等待回踩确认】", 1
+                withdrawn.append(f"⚠️ 今日曾触发 {record['name']}({code})｜现{state_label}，请重新确认")
+        elif state == "BUY_CANDIDATE":
+            badge, rank = "🎯【买点已确认】", 1
+            active_items.append(item)
+            grouped.setdefault(_canonical_destination(item["strategy"]), []).append(item)
+        elif state == "NEAR_ENTRY":
+            badge, rank = "🟡【日线候选·等待回踩确认】", 2
             ready.append(record)
+            active_items.append(item)
+            grouped.setdefault(_canonical_destination(item["strategy"]), []).append(item)
         else:
-            badge, rank = "⚪【观察中】", 2
+            badge = "⚪【涨停持续观察】" if item["strategy"] == "LIMIT_UP_CONTINUATION" else "⚪【观察中】"
+            rank = 3
             observing += 1
+            active_items.append(item)
+            grouped.setdefault(_canonical_destination(item["strategy"]), []).append(item)
         view["badges"][code] = badge
         view["ranks"][code] = rank
     view.update(buy_count=len(buys), ready_count=len(ready))
@@ -73,13 +141,32 @@ def build_observation_view(pool, at=None):
         lines.append(f"🟡 {record['name']}({record['code']}) | 等待回踩确认 | 日线{record.get('last_reviewed_date') or '--'}")
     if len(ready) > 8:
         lines.append(f"其余{len(ready) - 8}只候选见「🔎 持续观察池」，尚未触发盘中买点")
+    for destination, rows in grouped.items():
+        if rows:
+            label = _canonical_destination(rows[0]["strategy"]).split(" / ", 1)[-1]
+            lines.append(f"策略分组：{label} · {len(rows)}只")
     lines.append(f"⚪ 观察中 · {observing}只｜筛选命中不等于买点")
+    view["groups"] = grouped
+    total = len(active_items)
+    page_size = 8
+    view["page_count"] = max(1, math.ceil(total / page_size))
+    view["page"] = min(view["page"], view["page_count"])
+    start = (view["page"] - 1) * page_size
+    view["items"] = active_items[start:start + page_size]
     view["focus_lines"] = lines
     return view
 
 
+def build_limit_views(up_rows, down_rows):
+    return {
+        "limit_up": rank_limit_up(up_rows or []),
+        "limit_down": rank_limit_down(down_rows or []),
+        "expanded": False,
+    }
+
+
 def prioritize_stocks(rows, view):
-    return sorted(rows, key=lambda stock: view["ranks"].get(stock.get("code"), 2))
+    return sorted(rows, key=lambda stock: view["ranks"].get(stock.get("code"), 3))
 
 
 def decorate_stock(text, stock, view):

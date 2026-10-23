@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import asdict
 from datetime import datetime
+from capital_flow import CapitalFlowSnapshot
+from capital_flow_policy import assess_window
 from continuation_hold_policy import (
     ContinuationHoldInput,
     assess_continuation_hold,
     continuation_hold_to_dict,
     format_continuation_hold_info,
+)
+from candidate_state_policy import (
+    CandidateReviewInput,
+    CandidateState,
+    CandidateStrategy,
+    advance_candidate,
+    required_confirmation_rounds,
+    route_source,
 )
 import json
 import math
@@ -19,6 +30,7 @@ import tempfile
 
 from entry_structure import Ma20Slope, VolumeState, compute_entry_input, evaluate
 from high_position_policy import HighPositionInput, assess_high_position, high_position_to_dict
+from promotion_environment_policy import PromotionEnvironmentInput, evaluate_environment
 from observation_ui import build_observation_view, decorate_stock
 from strong_continuation_policy import (
     StrongContinuationInput,
@@ -54,34 +66,105 @@ def completed_bars(rows, at):
 
 class ObservationPool:
     MIN_OBSERVATION_DAYS = 2
-    MAX_OBSERVATION_DAYS = 5
+    MAX_OBSERVATION_DAYS = 10
     REENTRY_COOLDOWN_DAYS = 5
+    STATE_VERSION = 3
+    ACTIVE_STATUSES = {"observing", "ready"}
+    STRATEGY_DESTINATIONS = {
+        CandidateStrategy.PRE_BREAKOUT.value: "PRE_BREAKOUT / 启动前潜力",
+        CandidateStrategy.LEADER.value: "LEADER / 强势龙头",
+        CandidateStrategy.LIMIT_UP_CONTINUATION.value: "LIMIT_UP_CONTINUATION / 涨停持续观察",
+    }
     SOURCE_LABELS = {
         "strict": "严格", "relaxed": "宽松", "five_confirmed": "513确认",
         "five_waiting": "513观察", "strong": "强势延续",
     }
-    ACTIVE_STATUSES = {"observing", "ready"}
-
     def __init__(self, state_path=None):
         self.state_path = Path(state_path) if state_path else None
         self.records = {}
         self.load_error = None
+        self.config = {"promotion_environment_gate_enabled": False}
         if self.state_path and self.state_path.exists():
             try:
                 payload = json.loads(self.state_path.read_text(encoding="utf-8"))
-                if payload.get("version") != 2 or not isinstance(payload.get("records"), dict):
+                if payload.get("version") not in {2, self.STATE_VERSION}:
+                    raise ValueError("观察池文件版本无效")
+                if not isinstance(payload.get("records"), dict):
                     raise ValueError("观察池文件版本或结构无效")
+                config = payload.get("config") or {}
+                if isinstance(config.get("promotion_environment_gate_enabled"), bool):
+                    self.config["promotion_environment_gate_enabled"] = (
+                        config["promotion_environment_gate_enabled"]
+                    )
                 for code, record in payload["records"].items():
                     if not isinstance(record, dict) or record.get("code") != code:
                         raise ValueError("观察记录结构无效")
-                    if record.get("status") not in self.ACTIVE_STATUSES | {"expired", "eliminated"}:
-                        raise ValueError("观察记录状态无效")
-                    datetime.strptime(record["first_observed_date"], "%Y-%m-%d")
-                    if not isinstance(record.get("history"), list) or not isinstance(record.get("sources"), list):
-                        raise ValueError("观察记录历史无效")
-                self.records = payload["records"]
+                    self.records[code] = self._normalize_record(record)
             except (OSError, ValueError, TypeError, KeyError, AttributeError) as error:
                 self.load_error = f"观察池读取失败：{error}"
+
+    @classmethod
+    def _normalize_record(cls, record):
+        normalized = deepcopy(record)
+        if normalized.get("status") not in cls.ACTIVE_STATUSES | {"expired", "eliminated"}:
+            raise ValueError("观察记录状态无效")
+        datetime.strptime(normalized["first_observed_date"], "%Y-%m-%d")
+        if not isinstance(normalized.get("history"), list) or not isinstance(normalized.get("sources"), list):
+            raise ValueError("观察记录历史无效")
+
+        sources = normalized.get("sources") or []
+        strategy = normalized.get("strategy")
+        if strategy not in cls.STRATEGY_DESTINATIONS:
+            strategy = route_source(
+                ",".join(str(source) for source in sources),
+                strong_candidate="strong" in sources,
+                limit_candidate="limit" in sources,
+            ).value
+        old_status = normalized.get("status")
+        state = normalized.get("state")
+        if state not in {item.value for item in CandidateState}:
+            state = {
+                "ready": CandidateState.NEAR_ENTRY.value,
+                "expired": CandidateState.ELIMINATED.value,
+                "eliminated": CandidateState.ELIMINATED.value,
+            }.get(old_status, CandidateState.OBSERVING.value)
+
+        defaults = {
+            "strategy": strategy,
+            "state": state,
+            "entry_destination": cls.STRATEGY_DESTINATIONS[strategy],
+            "confirmation_rounds": 0,
+            "last_confirmation_at": None,
+            "confirmation_started_at": None,
+            "limit_streak": None,
+            "seal_quality_score": None,
+            "seal_quality_coverage_pct": None,
+            "data_coverage": None,
+            "related_sectors": [],
+            "flow_window": [],
+            "risk_evidence": [],
+            "breakout_risk": None,
+            "last_limit_seal_event": None,
+            "eliminated_reason": None,
+            "exit_date": None,
+            "reentry_cooldown_until": None,
+            "observation_dates": [],
+            "weak_dates": [],
+            "continuous_observation": False,
+            "limit_up_blocked": False,
+            "environment_evidence": [],
+            "environment_gate_reason": None,
+            "_environment_blocked": False,
+        }
+        for key, value in defaults.items():
+            normalized.setdefault(key, value)
+        normalized["status"] = {
+            CandidateState.OBSERVING.value: "observing",
+            CandidateState.NEAR_ENTRY.value: "ready",
+            CandidateState.BUY_CANDIDATE.value: "ready",
+            CandidateState.ELIMINATED.value: "eliminated",
+        }[normalized["state"]]
+        return normalized
 
     def _save(self, records):
         if self.state_path is None:
@@ -92,7 +175,16 @@ class ObservationPool:
             with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.state_path.parent,
                                              prefix=".observation.", suffix=".tmp", delete=False) as handle:
                 temp_path = handle.name
-                json.dump({"version": 2, "records": records}, handle, ensure_ascii=False, allow_nan=False)
+                json.dump(
+                    {
+                        "version": self.STATE_VERSION,
+                        "config": self.config,
+                        "records": records,
+                    },
+                    handle,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                )
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temp_path, self.state_path)
@@ -102,11 +194,38 @@ class ObservationPool:
 
     @staticmethod
     def _new_record(hit, date):
-        return {"code": hit["code"], "name": hit.get("name") or hit["code"],
-                "sources": [], "first_observed_date": date, "last_seen_date": date,
-                "last_reviewed_date": None, "observation_days": 0, "status": "observing",
-                "reason": "新入池，等待完整日线复核", "data_status": "待复核",
-                "price": None, "score": 0, "stop_price": None, "history": []}
+        strategy = route_source(
+            hit.get("source", "relaxed"),
+            strong_candidate=hit.get("strong_candidate", False),
+            limit_candidate=hit.get("limit_candidate", False),
+        ).value
+        return {
+            "code": hit["code"], "name": hit.get("name") or hit["code"],
+            "sources": [], "first_observed_date": date, "last_seen_date": date,
+            "last_reviewed_date": None, "observation_days": 0, "status": "observing",
+            "reason": "新入池，等待完整日线复核", "data_status": "待复核",
+            "price": None, "score": 0, "stop_price": None, "history": [],
+            "strategy": strategy,
+            "state": CandidateState.OBSERVING.value,
+            "entry_destination": ObservationPool.STRATEGY_DESTINATIONS[strategy],
+            "confirmation_rounds": 0, "last_confirmation_at": None,
+            "confirmation_started_at": None, "limit_streak": hit.get("limit_streak"),
+            "seal_quality_score": hit.get("seal_quality_score"),
+            "seal_quality_coverage_pct": hit.get("seal_quality_coverage_pct"),
+            "data_coverage": hit.get("data_coverage"),
+            "related_sectors": list(hit.get("related_sectors") or []),
+            "flow_window": list(hit.get("flow_window") or []),
+            "risk_evidence": list(hit.get("risk_evidence") or []),
+            "breakout_risk": hit.get("breakout_risk"),
+            "last_limit_seal_event": hit.get("last_limit_seal_event"),
+            "eliminated_reason": None, "exit_date": None,
+            "reentry_cooldown_until": None,
+            "observation_dates": [], "weak_dates": [],
+            "continuous_observation": bool(hit.get("continuous_observation", False)),
+            "limit_up_blocked": bool(hit.get("limit_up_blocked", False)),
+            "environment_evidence": [], "environment_gate_reason": None,
+            "_environment_blocked": False,
+        }
 
     @staticmethod
     def _assess(bars, benchmark, strong_candidate=False):
@@ -270,7 +389,115 @@ class ObservationPool:
                 "trend_mode": trend_result.conflict.name,
                 "missing_data": list(trend_result.missing_data) + list(high_result.missing_data)}
 
-    def _set_status(self, record):
+    @staticmethod
+    def required_confirmation_rounds(limit_streak):
+        return required_confirmation_rounds(limit_streak)
+
+    @staticmethod
+    def _legacy_status(state):
+        return {
+            CandidateState.OBSERVING.value: "observing",
+            CandidateState.NEAR_ENTRY.value: "ready",
+            CandidateState.BUY_CANDIDATE.value: "ready",
+            CandidateState.ELIMINATED.value: "eliminated",
+        }[state]
+
+    def apply_promotion_environment(
+        self,
+        record,
+        environment,
+        *,
+        enabled=None,
+        at=None,
+    ):
+        if self.load_error:
+            raise ValueError(self.load_error)
+        enabled = (
+            self.config.get("promotion_environment_gate_enabled", False)
+            if enabled is None else bool(enabled)
+        )
+        decision = evaluate_environment(
+            PromotionEnvironmentInput(
+                shanghai_change_pct=environment.get("shanghai_change_pct"),
+                shenzhen_change_pct=environment.get("shenzhen_change_pct"),
+                limit_up_count=environment.get("limit_up_count"),
+                limit_down_count=environment.get("limit_down_count"),
+                board_changes=list(environment.get("board_changes") or []),
+            ),
+            enabled=enabled,
+        )
+        record.update(
+            environment_evidence=list(decision.evidence),
+            environment_gate_reason=decision.reason,
+            _environment_blocked=decision.blocked,
+        )
+        if at:
+            record["environment_evaluated_at"] = at.isoformat()
+        return {
+            "blocked": decision.blocked,
+            "reason": decision.reason,
+            "evidence": list(decision.evidence),
+        }
+
+    def observe_candidate_sample(
+        self,
+        code,
+        at,
+        *,
+        ordinary_gates_passed,
+        price_trend_valid,
+        trend_weak=False,
+        sealed=False,
+        environment_blocked=False,
+        cumulative_volume_increase=False,
+        limit_streak=None,
+    ):
+        if self.load_error:
+            raise ValueError(self.load_error)
+        code = str(code or "").lower()
+        if code not in self.records:
+            raise KeyError(f"观察记录不存在：{code}")
+        records = deepcopy(self.records)
+        record = records[code]
+        transition = advance_candidate(
+            record,
+            CandidateReviewInput(
+                at=at,
+                ordinary_gates_passed=ordinary_gates_passed,
+                trend_weak=trend_weak,
+                price_trend_valid=price_trend_valid,
+                fresh_sample=True,
+                sealed=sealed,
+                limit_streak=(
+                    record.get("limit_streak")
+                    if limit_streak is None else limit_streak
+                ),
+                environment_blocked=environment_blocked,
+                cumulative_volume_increase=cumulative_volume_increase,
+            ),
+        )
+        record.clear()
+        record.update(transition.record)
+        record["status"] = self._legacy_status(record["state"])
+        record["last_reviewed_date"] = at.strftime("%Y-%m-%d")
+        record["data_status"] = "已复核"
+        if transition.blockers:
+            record["reason"] = "；".join(transition.blockers)
+        elif record["state"] == CandidateState.BUY_CANDIDATE.value:
+            record["reason"] = "买点已确认，仅代表观察状态升级，不代表自动下单"
+        elif record["state"] == CandidateState.NEAR_ENTRY.value:
+            record["reason"] = "买点待确认，继续等待时间分离的新行情样本"
+        elif record["state"] == CandidateState.ELIMINATED.value:
+            record["reason"] = record.get("eliminated_reason") or "候选已淘汰"
+        else:
+            record["reason"] = "继续观察"
+        if record["status"] not in self.ACTIVE_STATUSES:
+            record["closed_date"] = at.strftime("%Y-%m-%d")
+        self._save(records)
+        self.records = records
+        return deepcopy(record)
+
+    def _set_status(self, record, review_at=None):
         history = record["history"]
         latest = history[-1]
         record.update({key: latest[key] for key in (
@@ -282,7 +509,6 @@ class ObservationPool:
         ) if key in latest})
         record["last_reviewed_date"] = latest["date"]
         record["observation_days"] = len(history)
-        weak_twice = len(history) >= 2 and all(item["trend_weak"] for item in history[-2:])
         strong_state = latest.get("strong_state")
         dynamic_risk = strong_state in {"M20_BREAK_RISK", "M5_BREAK_RISK"}
         strong_structural_risk = (
@@ -291,7 +517,7 @@ class ObservationPool:
         )
         if dynamic_risk or strong_structural_risk:
             confirmed = latest.get("strong_risk_confirmed") is True
-            status = "eliminated" if confirmed else "observing"
+            state = CandidateState.ELIMINATED.value if confirmed else CandidateState.OBSERVING.value
             decision = "破位确认" if confirmed else "风险预警"
             risk_line = latest.get("risk_line") or "动态"
             risk_price = latest.get("risk_price")
@@ -299,25 +525,53 @@ class ObservationPool:
             reason = f"{decision}：{strong_state}，参考{risk_line}{risk_price_text}，风险优先于候选晋级"
             record["can_enter"] = False
         elif strong_state == "EXTENDED_CONTINUATION":
-            status, reason = "observing", "高位或乖离较大，仅作延伸观察，不进入确定候选"
+            state, reason = CandidateState.OBSERVING.value, "高位或乖离较大，仅作延伸观察，不进入确定候选"
             record["can_enter"] = False
         elif strong_state == "MISSING":
-            status, reason = "observing", "强势延续核心数据不足，不做默认放行，等待复核"
+            state, reason = CandidateState.OBSERVING.value, "强势延续核心数据不足，不做默认放行，等待复核"
             record["can_enter"] = False
-        elif weak_twice:
-            status, reason = "eliminated", "连续两个完整交易日趋势转弱，淘汰观察"
-        elif latest["benchmark_ok"] is None:
-            status, reason = "observing", latest["reason"]
-        elif len(history) >= self.MIN_OBSERVATION_DAYS and latest["can_enter"]:
-            status, reason = "ready", (
-                f"观察{len(history)}个交易日，{latest['structure']}成立，大盘过滤通过；"
-                f"{latest['reason']}"
-            )
-        elif len(history) >= self.MAX_OBSERVATION_DAYS:
-            status, reason = "expired", f"观察满{self.MAX_OBSERVATION_DAYS}个交易日，当前未形成可介入结构"
         else:
-            status = "observing"
-            reason = "首个完整交易日，继续观察；" + latest["reason"] if len(history) == 1 else latest["reason"]
+            review_at = review_at or datetime.fromisoformat(f"{latest['date']}T15:00:00")
+            transition = advance_candidate(
+                record,
+                CandidateReviewInput(
+                    at=review_at,
+                    ordinary_gates_passed=(
+                        latest.get("can_enter") is True
+                        and latest.get("benchmark_ok") is True
+                    ),
+                    trend_weak=latest.get("trend_weak", False),
+                    price_trend_valid=not latest.get("trend_weak", False),
+                    fresh_sample=True,
+                    sealed=bool(
+                        latest.get("sealed")
+                        or (record.get("last_limit_seal_event") or {}).get("sealed")
+                    ),
+                    limit_streak=record.get("limit_streak"),
+                    environment_blocked=bool(record.get("_environment_blocked")),
+                    cumulative_volume_increase=bool(
+                        latest.get("cumulative_volume_increase")
+                    ),
+                ),
+            )
+            record.update(transition.record)
+            latest = record["history"][-1]
+            state = record["state"]
+            if transition.blockers:
+                reason = "；".join(transition.blockers) + "；" + latest["reason"]
+            elif state == CandidateState.BUY_CANDIDATE.value:
+                reason = "买点已确认，仅代表观察状态升级，不代表自动下单"
+            elif state == CandidateState.NEAR_ENTRY.value:
+                reason = f"买点待确认：{latest['reason']}"
+            else:
+                reason = latest["reason"]
+
+        record["state"] = state
+        status = self._legacy_status(state)
+        if state == CandidateState.OBSERVING.value and len(history) == 1:
+            reason = "首个完整交易日，继续观察；" + reason
+        if state == CandidateState.ELIMINATED.value and not record.get("eliminated_reason"):
+            record["eliminated_reason"] = reason
         record.update(status=status, reason=reason, data_status="已复核")
         if status == "observing" and latest["benchmark_ok"] is None:
             record["data_status"] = "待复核：大盘同日完整日线暂缺"
@@ -396,7 +650,10 @@ class ObservationPool:
                         history[-1] = assessment
                     else:
                         history.append(assessment)
-                    self._set_status(record)
+                    self._set_status(
+                        record,
+                        datetime.fromisoformat(f"{bar['date']}T15:00:00"),
+                    )
                     if record["status"] not in self.ACTIVE_STATUSES:
                         break
                 if record["status"] in self.ACTIVE_STATUSES:
@@ -425,6 +682,64 @@ class ObservationPool:
         records[alert["code"]]["last_entry_alert"] = dict(alert)
         self._save(records)
         self.records = records
+
+    @staticmethod
+    def _flow_snapshot(row):
+        as_of = row.get("as_of")
+        return CapitalFlowSnapshot(
+            key=str(row.get("key") or row.get("code") or ""),
+            name=str(row.get("name") or ""),
+            kind=str(row.get("kind") or "stock"),
+            quote_date=str(row.get("quote_date") or ""),
+            as_of=(
+                as_of if isinstance(as_of, datetime)
+                else datetime.fromisoformat(str(as_of))
+            ),
+            source=str(row.get("source") or ""),
+            scope=str(row.get("scope") or ""),
+            session=str(row.get("session") or ""),
+            net_yi=row.get("net_yi"),
+            net_ratio_pct=row.get("net_ratio_pct"),
+            inflow_yi=row.get("inflow_yi"),
+            outflow_yi=row.get("outflow_yi"),
+            large_net_yi=row.get("large_net_yi"),
+            super_large_net_yi=row.get("super_large_net_yi"),
+            stale=bool(row.get("stale", False)),
+            turnover_yi=row.get("turnover_yi"),
+        )
+
+    def record_fund_flow_snapshot(self, code, snapshot, change_pct=None):
+        if self.load_error:
+            raise ValueError(self.load_error)
+        code = str(code or "").lower()
+        if code not in self.records:
+            raise KeyError(f"观察记录不存在：{code}")
+        if not isinstance(snapshot, CapitalFlowSnapshot):
+            raise TypeError("资金流快照类型无效")
+        records = deepcopy(self.records)
+        record = records[code]
+        row = asdict(snapshot)
+        row["as_of"] = snapshot.as_of.isoformat()
+        by_date = {
+            item.get("quote_date"): item
+            for item in record.get("flow_window", [])
+            if isinstance(item, dict) and item.get("quote_date")
+        }
+        by_date[snapshot.quote_date] = row
+        flow_window = [by_date[key] for key in sorted(by_date)[-5:]]
+        assessment = assess_window(
+            [self._flow_snapshot(item) for item in flow_window],
+            change_pct,
+        )
+        assessment_dict = asdict(assessment)
+        assessment_dict["tone"] = assessment.tone.value
+        assessment_dict["sample_dates"] = list(assessment.sample_dates)
+        record["flow_window"] = flow_window
+        record["flow_window_assessment"] = assessment_dict
+        record["_flow_blocks_promotion"] = assessment.blocks_promotion
+        self._save(records)
+        self.records = records
+        return deepcopy(record)
 
     def menu_lines(self, limit=20, at=None):
         records = list(self.records.values())
@@ -467,7 +782,8 @@ class ObservationPool:
             if record.get("last_entry_alert"):
                 lines.append(record["last_entry_alert"]["body"])
             for snapshot in record["history"]:
-                lines.append(f"{snapshot['date']} | 收盘{snapshot['price']:.2f} | {snapshot['score']}/4项 | {snapshot['decision']}")
+                decision = snapshot.get("decision") or snapshot.get("reason") or record.get("reason") or "已复核"
+                lines.append(f"{snapshot['date']} | 收盘{snapshot['price']:.2f} | {snapshot['score']}/4项 | {decision}")
             for previous in record.get("previous_rounds", []):
                 lines.append(f"历史观察轮次 {previous['first_observed_date']}：{previous['reason']}")
         return "\n".join(lines)

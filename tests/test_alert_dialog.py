@@ -4,7 +4,7 @@
 
 背景：com.apple.python3 的 timeSensitiveSetting=0，TimeSensitive 中断等级
 会被系统降级；专注模式下系统通知只进通知列表、不弹横幅。2026-10-08 大盘
-跌 3.7% 因此全程零横幅。告警对话框（NSAlert「知道了，我去处理」）是与通知
+跌 3.7% 因此全程零横幅。告警对话框（NSAlert「知道了」）是与通知
 系统完全解耦的兜底通道。
 
 2026-10-22 起取代置顶横幅卡片（深红/橙棕圆角卡片废弃）：danger/crash 与
@@ -32,7 +32,7 @@ class AlertDialogTests(unittest.TestCase):
         src = inspect.getsource(StockMenuBar._show_alert_dialog)
         self.assertIn('NSAlert', src, "缺少模态对话框")
         self.assertIn('runModal', src, "对话框必须模态（强制确认）")
-        self.assertIn('知道了，我去处理', src, "缺统一按钮文案")
+        self.assertIn("addButtonWithTitle_('知道了')", src, "缺统一按钮文案")
         self.assertIn('【{label}】', src, "对话框标题未带级别前缀")
         self.assertIn('_run_on_main_once', src, "对话框没切回主线程（会触发退出码133）")
 

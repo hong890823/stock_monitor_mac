@@ -6,15 +6,21 @@ from intraday_trade_policy import (
     PositionEligibility,
     evaluate_trade_action,
 )
+from trade_action_guard import guard_actionable_copy
 
 
-def evidence(*, m15=2, aligned=True, risk=False, complete=True, risk_complete=True):
+def evidence(
+    *, m15=2, aligned=True, risk=False, complete=True, risk_complete=True,
+    risk_confirmations=2, risk_level="ELEVATED",
+):
     return TimeframeEvidence(
         m15_confirmations=m15,
         m30_aligned=aligned,
         risk_confirmed=risk,
         complete=complete,
         risk_complete=risk_complete,
+        risk_confirmations=risk_confirmations,
+        risk_level=risk_level,
         last_completed_15m="2026-10-20 10:15:00",
         last_completed_30m="2026-10-20 10:00:00",
         m15_distance_pct=0.004,
@@ -80,6 +86,54 @@ class IntradayTradePolicyTest(unittest.TestCase):
 
         self.assertEqual(decision.action, DecisionAction.WAIT)
         self.assertIn("失效价", decision.message)
+
+    def test_volume_absorption_reduces_only_one_lot(self):
+        decision = evaluate_trade_action(
+            "risk_exit",
+            evidence(risk=True, risk_confirmations=2),
+            PositionEligibility(total_quantity=300, sellable_quantity=300),
+            invalidation_price=12.0,
+            volume_context={"absorption_confirmed": True},
+        )
+
+        self.assertEqual(decision.action, DecisionAction.RISK_REDUCE)
+        self.assertEqual(decision.max_sell_quantity, 100)
+
+    def test_insufficient_stock_volume_blocks_buy(self):
+        decision = evaluate_trade_action(
+            "buy",
+            evidence(),
+            PositionEligibility(total_quantity=500, sellable_quantity=500, buy_capacity_quantity=100),
+            invalidation_price=12.0,
+            volume_context={"stock_volume_confirming": False},
+        )
+
+        self.assertEqual(decision.action, DecisionAction.WAIT)
+        self.assertIn("量能", decision.message)
+        guarded = guard_actionable_copy(
+            "buy", decision.message,
+            eligibility=PositionEligibility(
+                total_quantity=500,
+                sellable_quantity=500,
+                buy_capacity_quantity=100,
+            ),
+            evidence=evidence(),
+            trade_date="2026-10-20",
+            invalidation_price=12.0,
+        )
+        self.assertEqual(guarded.level, "observation")
+
+    def test_missing_volume_evidence_blocks_buy(self):
+        decision = evaluate_trade_action(
+            "buy",
+            evidence(),
+            PositionEligibility(total_quantity=500, sellable_quantity=500, buy_capacity_quantity=100),
+            invalidation_price=12.0,
+            volume_context={},
+        )
+
+        self.assertEqual(decision.action, DecisionAction.WAIT)
+        self.assertIn("量能证据不足", decision.message)
 
 
 if __name__ == "__main__":

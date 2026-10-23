@@ -81,7 +81,7 @@ class IntradayNotificationTests(unittest.TestCase):
         subject._notify.assert_any_call(
             "⚠️ 中天科技 跌破支撑",
             "现价 30.00",
-            "风险观察：风险条件尚未经新鲜15分钟K线确认，今日不作卖出处置。",
+            "风险观察：等待连续两根新鲜15分钟K线及历史风险级别确认，今日不作卖出处置。",
         )
         logs = "\n".join(call.args[0] for call in subject.log.call_args_list)
         self.assertIn("支撑30.50｜反抽不站回减约600股", logs)

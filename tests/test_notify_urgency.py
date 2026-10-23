@@ -163,7 +163,7 @@ def test_raise_urgency_has_backup_channels():
     dialog_src = inspect.getsource(StockMenuBar._show_alert_dialog)
     assert 'NSAlert' in dialog_src, "缺少模态对话框"
     assert '_run_on_main_once' in dialog_src, "对话框没切回主线程（会触发退出码133）"
-    assert '知道了，我去处理' in dialog_src, "缺统一按钮文案"
+    assert "addButtonWithTitle_('知道了')" in dialog_src, "缺统一按钮文案"
     attention_src = inspect.getsource(StockMenuBar._request_dock_attention)
     assert 'requestUserAttention_' in attention_src, "Dock 弹跳未调用系统接口"
     print("  ✓ danger/crash 有告警对话框 + 音效 + Dock 弹跳（置顶横幅已废弃）")

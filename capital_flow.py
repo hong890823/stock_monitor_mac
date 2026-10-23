@@ -77,6 +77,7 @@ class CapitalFlowSnapshot:
     large_net_yi: Optional[float] = None
     super_large_net_yi: Optional[float] = None
     stale: bool = False
+    turnover_yi: Optional[float] = None
 
 
 def is_fresh(
@@ -120,6 +121,7 @@ def normalize_flow_frame(
     outflow_column: Optional[str] = None,
     large_net_column: Optional[str] = None,
     super_large_net_column: Optional[str] = None,
+    turnover_column: Optional[str] = None,
 ) -> Dict[str, CapitalFlowSnapshot]:
     result = {}
     for row in _iter_rows(frame):
@@ -144,6 +146,7 @@ def normalize_flow_frame(
                 parse_amount_yi(row.get(super_large_net_column))
                 if super_large_net_column else None
             ),
+            turnover_yi=parse_amount_yi(row.get(turnover_column)) if turnover_column else None,
         )
         result[key] = snapshot
     return result

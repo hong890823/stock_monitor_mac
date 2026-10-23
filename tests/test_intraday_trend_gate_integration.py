@@ -47,6 +47,8 @@ def timeframe_evidence(*, risk=False):
         clearance_confirmed=True,
         risk_complete=True,
         risk_confirmed=risk,
+        risk_confirmations=3 if risk else 0,
+        risk_level="CRITICAL" if risk else "NORMAL",
         last_bar_rejected=False,
     )
 

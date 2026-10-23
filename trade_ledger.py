@@ -68,6 +68,7 @@ class TradeLedger:
         self._lots: Dict[str, List[_Lot]] = {}
         self._legacy_codes = set()
         self._reference_costs: Dict[str, float] = {}
+        self._inconsistent_codes = set()
         if self.path and self.path.exists():
             self._load()
 
@@ -225,6 +226,7 @@ class TradeLedger:
             deepcopy(self._lots),
             set(self._legacy_codes),
             dict(self._reference_costs),
+            set(self._inconsistent_codes),
         )
 
     def restore_state(self, snapshot):
@@ -234,6 +236,7 @@ class TradeLedger:
             self._lots,
             self._legacy_codes,
             self._reference_costs,
+            self._inconsistent_codes,
         ) = snapshot
 
     @staticmethod
@@ -380,26 +383,39 @@ class TradeLedger:
         average_cost = total_cost / quantity if quantity else 0.0
         if quantity and normalized_code in self._reference_costs:
             average_cost = self._reference_costs[normalized_code]
+        consistent = normalized_code not in self._inconsistent_codes
         return {
             "code": normalized_code,
             "quantity": quantity,
             "sellable_quantity": sellable,
+            "actionable_sellable_quantity": sellable if consistent else 0,
             "today_locked_quantity": today_locked,
             "next_sellable_quantity": quantity,
             "average_cost": average_cost,
+            "consistent": consistent,
         }
 
     def sync_legacy_positions(self, positions: Iterable[dict]):
         changed = False
         for position in positions or []:
             code = str(position.get("code") or "").lower().strip()
-            if not code or code in self._legacy_codes:
+            if not code:
                 continue
-            if any(trade.code == code for trade in self.trades):
+            expected_quantity = int(position.get("quantity") or 0)
+            if (
+                code in self._lots
+                or any(trade.code == code for trade in self.trades)
+                or any(adjustment.code == code for adjustment in self.adjustments)
+            ):
                 self._legacy_codes.add(code)
+                changed = self._reconcile_existing_position(
+                    code, expected_quantity
+                ) or changed
                 continue
-            quantity = int(position.get("quantity") or 0)
-            if quantity <= 0:
+            if code in self._legacy_codes:
+                self._inconsistent_codes.add(code)
+                continue
+            if expected_quantity <= 0:
                 self._legacy_codes.add(code)
                 continue
             trade = Trade(
@@ -408,7 +424,7 @@ class TradeLedger:
                 code=code,
                 name=str(position.get("name") or code),
                 trade_date="0001-01-01",
-                quantity=quantity,
+                quantity=expected_quantity,
                 price=float(position.get("cost") or 0.000001),
                 source="legacy",
             )
@@ -417,6 +433,38 @@ class TradeLedger:
             changed = True
         if changed and self.path:
             self._save()
+
+    def _reconcile_existing_position(self, code: str, expected_quantity: int) -> bool:
+        lots = self._lots.get(code, [])
+        current_quantity = sum(lot.remaining for lot in lots)
+        if current_quantity == expected_quantity:
+            self._inconsistent_codes.discard(code)
+            return False
+        excess = current_quantity - expected_quantity
+        if excess <= 0:
+            self._inconsistent_codes.add(code)
+            return False
+        legacy_lots = [lot for lot in lots if lot.source == "legacy"]
+        duplicate_pairs = [
+            (legacy_lot, other_lot)
+            for legacy_lot in legacy_lots
+            for other_lot in lots
+            if other_lot is not legacy_lot
+            and other_lot.remaining == legacy_lot.remaining == excess
+            and abs(other_lot.price - legacy_lot.price) < 1e-9
+        ]
+        if not duplicate_pairs:
+            self._inconsistent_codes.add(code)
+            return False
+        legacy_lot, _ = duplicate_pairs[0]
+        self._lots[code] = [lot for lot in lots if lot is not legacy_lot]
+        self.trades = [
+            trade for trade in self.trades
+            if trade.trade_id != legacy_lot.lot_id
+        ]
+        self._inconsistent_codes.discard(code)
+        self._prune_lots()
+        return True
 
     def _save(self):
         if not self.path:

@@ -22,10 +22,11 @@ def bar(timestamp, close, support=12.0):
 
 
 class FakeLedger:
-    def __init__(self, sellable=500, locked=100, total=600):
+    def __init__(self, sellable=500, locked=100, total=600, consistent=True):
         self.sellable = sellable
         self.locked = locked
         self.total = total
+        self.consistent = consistent
 
     def position_summary(self, code, as_of_date):
         return {
@@ -33,6 +34,7 @@ class FakeLedger:
             "quantity": self.total,
             "sellable_quantity": self.sellable,
             "today_locked_quantity": self.locked,
+            "consistent": self.consistent,
         }
 
 
@@ -79,7 +81,10 @@ class IntradayTradeIntegrationTest(unittest.TestCase):
 
     def test_today_bought_only_risk_signal_cannot_sell_today(self):
         app = subject(
-            [bar("2026-10-20 10:45:00", 11.8)],
+            [
+                bar("2026-10-20 10:30:00", 11.8),
+                bar("2026-10-20 10:45:00", 11.75),
+            ],
             [bar("2026-10-20 10:30:00", 11.8)],
             FakeLedger(sellable=0, locked=100, total=100),
         )
@@ -94,6 +99,11 @@ class IntradayTradeIntegrationTest(unittest.TestCase):
             signal, "sz000737", "北方铜业", 11.8, 12.0, 13.0,
             now=self.now, buy_capacity_quantity=0,
             trade_date="2026-10-20",
+            historical_context={
+                "price_location": "LOW",
+                "closes_below_ma20": 10,
+                "invalidation_price": 10.5,
+            },
         )
 
         self.assertEqual(result.signal_type, IntradaySignalType.NEXT_DAY_REVIEW)
@@ -101,9 +111,12 @@ class IntradayTradeIntegrationTest(unittest.TestCase):
         self.assertIn("下一交易日", result.notification_body)
         self.assertNotIn("今日卖出", result.notification_body)
 
-    def test_risk_exit_uses_sellable_and_does_not_wait_for_30m(self):
+    def test_two_confirmed_risk_bars_reduce_one_lot_and_do_not_wait_for_30m(self):
         app = subject(
-            [bar("2026-10-20 10:45:00", 11.8)],
+            [
+                bar("2026-10-20 10:30:00", 11.8),
+                bar("2026-10-20 10:45:00", 11.75),
+            ],
             [bar("2026-10-20 10:30:00", 11.7)],
             FakeLedger(sellable=500, locked=100, total=600),
         )
@@ -118,13 +131,44 @@ class IntradayTradeIntegrationTest(unittest.TestCase):
             signal, "sz000737", "北方铜业", 11.8, 12.0, 13.0,
             now=self.now, buy_capacity_quantity=0,
             trade_date="2026-10-20",
+            historical_context={
+                "price_location": "LOW",
+                "closes_below_ma20": 10,
+                "range_low": 10.5,
+                "invalidation_price": 10.5,
+                "major_trend": "MISSING",
+            },
         )
 
-        self.assertEqual(result.signal_type, IntradaySignalType.EXIT_RISK)
-        self.assertIn("今日可卖500股", result.notification_body)
+        self.assertEqual(result.signal_type, IntradaySignalType.EXIT_WINDOW)
+        self.assertIn("最多减100股", result.notification_body)
         self.assertIn("不纳入", result.notification_body)
         self.assertEqual(app._intraday_bar_fetcher.call_count, 1)
         self.assertEqual(app._intraday_bar_fetcher.call_args.args[1], 15)
+
+    def test_ledger_mismatch_blocks_risk_action(self):
+        app = subject(
+            [
+                bar("2026-10-20 10:30:00", 11.8),
+                bar("2026-10-20 10:45:00", 11.75),
+            ],
+            [],
+            FakeLedger(sellable=500, locked=0, total=600, consistent=False),
+        )
+        signal = IntradaySignal(
+            IntradaySignalType.EXIT_RISK,
+            "🔴 北方铜业 风险离场",
+            "确认跌破支撑后离场。",
+            "支撑12.03｜风险离场",
+        )
+
+        result = app._apply_intraday_trade_policy(
+            signal, "sz000737", "北方铜业", 11.8, 12.0, 13.0,
+            now=self.now, trade_date="2026-10-20",
+        )
+
+        self.assertEqual(result.signal_type, IntradaySignalType.TRADE_WAIT)
+        self.assertIn("持仓账本数量不一致", result.notification_body)
 
     def test_t_sell_without_dual_confirmation_is_suppressed(self):
         app = subject(

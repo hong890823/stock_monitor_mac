@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta
-from typing import Callable, Iterable, List, Optional
+from typing import Callable, Iterable, List, Mapping, Optional
 
 
 @dataclass(frozen=True)
@@ -21,6 +21,10 @@ class TimeframeEvidence:
     m30_distance_pct: float = 0.0
     last_bar_rejected: bool = False
     clearance_confirmed: bool = False
+    risk_confirmations: int = 0
+    risk_threshold_pct: float = 0.005
+    risk_breach_pct: float = 0.0
+    risk_level: str = "NORMAL"
 
 
 def _session_slots(quote_date: str, scale: int) -> List[datetime]:
@@ -154,6 +158,7 @@ def build_timeframe_evidence(
     resistance: float,
     now: datetime,
     quote_date: Optional[str] = None,
+    historical_context: Optional[Mapping] = None,
 ) -> TimeframeEvidence:
     bars15 = list(bars15 or [])
     bars30 = list(bars30 or [])
@@ -182,11 +187,20 @@ def build_timeframe_evidence(
         and bars30[-1]["timestamp"] == latest30
         and bars30[-1]["timestamp"][:10] == str(quote_date)[:10]
     )
+    risk_threshold_pct = _risk_threshold_pct(bars15, support)
+    risk_breach_pct = max(0.0, (support - price) / support) if support > 0 else 0.0
+    risk_price_threshold = support * (1 - risk_threshold_pct)
     risk_confirmed = bool(
         support > 0
         and bars15
-        and price < support * 0.995
-        and bars15[-1]["close"] < support * 0.995
+        and price < risk_price_threshold
+        and bars15[-1]["close"] < risk_price_threshold
+    )
+    risk_confirmations = _risk_confirmations(
+        bars15, price, risk_price_threshold
+    ) if risk_confirmed else 0
+    risk_level = _historical_risk_level(
+        price, historical_context or {}
     )
     if threshold > 0 and confirmations:
         confirmed_bars = bars15[-min(confirmations, 2):]
@@ -233,4 +247,70 @@ def build_timeframe_evidence(
         m30_distance_pct=m30_distance_pct,
         last_bar_rejected=last_bar_rejected,
         clearance_confirmed=clearance_confirmed,
+        risk_confirmations=risk_confirmations,
+        risk_threshold_pct=risk_threshold_pct,
+        risk_breach_pct=risk_breach_pct,
+        risk_level=risk_level,
     )
+
+
+def _risk_threshold_pct(bars15: List[dict], support: float) -> float:
+    if support <= 0 or not bars15:
+        return 0.005
+    true_ranges = []
+    previous_close = None
+    for bar in bars15[-14:]:
+        high = float(bar["high"])
+        low = float(bar["low"])
+        close = float(bar["close"])
+        candidates = [high - low]
+        if previous_close is not None:
+            candidates.extend((abs(high - previous_close), abs(low - previous_close)))
+        true_ranges.append(max(candidates))
+        previous_close = close
+    atr = sum(true_ranges) / len(true_ranges)
+    atr_pct = atr / support
+    return min(0.015, max(0.005, atr_pct * 0.5))
+
+
+def _risk_confirmations(
+    bars15: List[dict], price: float, risk_price_threshold: float
+) -> int:
+    if not bars15 or price >= risk_price_threshold:
+        return 0
+    count = 0
+    for bar in reversed(bars15):
+        if float(bar["close"]) >= risk_price_threshold:
+            break
+        count += 1
+        if count >= 3:
+            break
+    return count
+
+
+def _historical_risk_level(price: float, context: Mapping) -> str:
+    if any(bool(context.get(key)) for key in (
+        "systemic_risk",
+        "portfolio_risk",
+        "event_risk",
+        "high_exit_risk",
+    )):
+        return "CRITICAL"
+    invalidation = float(context.get("invalidation_price") or 0)
+    range_low = float(context.get("range_low") or 0)
+    major_trend = str(context.get("major_trend") or "").upper()
+    no_new_low = context.get("five_day_no_new_low")
+    if invalidation > 0 and price <= invalidation:
+        return "CRITICAL"
+    if range_low > 0 and price < range_low:
+        return "CRITICAL"
+    if major_trend == "DOWN" and no_new_low is False:
+        return "CRITICAL"
+    closes_below_ma20 = int(context.get("closes_below_ma20") or 0)
+    if (
+        str(context.get("price_location") or "").upper() == "LOW"
+        or major_trend == "DOWN"
+        or closes_below_ma20 >= 5
+    ):
+        return "ELEVATED"
+    return "NORMAL"

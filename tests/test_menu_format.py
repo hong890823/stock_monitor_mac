@@ -215,15 +215,15 @@ class IndicatorMenuSeparatorTests(unittest.TestCase):
     def _app(self):
         app = StockMenuBar.__new__(StockMenuBar)  # 不跑 __init__，避免拉起 AppKit
         # `menu` 是 rumps 的 property，赋值会走真实 NSMenu；直接写 `_menu`。
-        app._menu = {"📈 指标策略": _FakeMenuItem("📈 指标策略")}
+        app._menu = {"📈 选股": _FakeMenuItem("📈 选股")}
         app.indicator_menu_titles = lambda: ["趋势突破 甲", "513 乙"]
         return app
 
     def test_results_are_added_after_the_separator(self):
         app = self._app()
         with mock.patch.object(stock_menubar, "rumps", _FakeRumps):
-            app.update_indicator_menu()
-        children = app._menu["📈 指标策略"].children
+            app.update_selection_menu()
+        children = app._menu["📈 选股"].children
         titles = [c.title for c in children if isinstance(c, _FakeMenuItem)]
         self.assertIn("趋势突破 甲", titles)
         self.assertIn("513 乙", titles)
@@ -233,11 +233,14 @@ class IndicatorMenuSeparatorTests(unittest.TestCase):
     def test_results_come_after_the_action_buttons(self):
         app = self._app()
         with mock.patch.object(stock_menubar, "rumps", _FakeRumps):
-            app.update_indicator_menu()
-        titles = [c.title for c in app._menu["📈 指标策略"].children
+            app.update_selection_menu()
+        titles = [c.title for c in app._menu["📈 选股"].children
                   if isinstance(c, _FakeMenuItem)]
-        self.assertTrue(titles[0].startswith("🔄 重扫指标"))
         self.assertEqual(titles[-1], "513 乙")
+        self.assertLess(
+            titles.index("🔄 重扫选股（前200，秒级）"),
+            titles.index("趋势突破 甲"),
+        )
 
 
 if __name__ == "__main__":

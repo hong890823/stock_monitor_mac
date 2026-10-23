@@ -105,8 +105,16 @@ def guard_intraday_signal(
     evidence: Any = None,
     trade_date: Optional[str] = None,
     invalidation_price: float = 0.0,
+    max_quantity: int = 0,
 ) -> GuardedCopy:
     kind = action_kind_for_signal(signal_type, text)
+    if kind == "risk_exit" and evidence is not None:
+        critical = bool(
+            _evidence_value(evidence, "risk_level", "NORMAL") == "CRITICAL"
+            and _evidence_value(evidence, "risk_confirmations", 0) >= 3
+        )
+        if not critical:
+            kind = "risk_reduce"
     if kind == "hold":
         return GuardedCopy("observation", str(text or "仅观察：当前没有可执行动作。"), reason="观察信号")
     return guard_actionable_copy(
@@ -116,6 +124,7 @@ def guard_intraday_signal(
         evidence=evidence,
         trade_date=trade_date,
         invalidation_price=invalidation_price,
+        max_quantity=max_quantity,
     )
 
 
@@ -126,15 +135,14 @@ def guard_actionable_copy(
     evidence: Any = None,
     trade_date: Optional[str] = None,
     invalidation_price: float = 0.0,
+    max_quantity: int = 0,
 ) -> GuardedCopy:
     kind = str(kind or "").lower().strip()
     text = str(text or "").strip()
     if kind in {"buy", "add"}:
         if not _valid_trade_date(trade_date):
             return GuardedCopy("observation", "仅观察：行情日期未确认，不执行买入或补仓。", reason="缺少行情日期")
-        if "仅观察" in text and any(
-            marker in text for marker in ("趋势", "高位", "市场", "板块", "15/30")
-        ):
+        if "仅观察" in text:
             return GuardedCopy("observation", text, reason="交易门控限制")
         if (
             not _evidence_value(evidence, "complete")
@@ -150,22 +158,43 @@ def guard_actionable_copy(
             return GuardedCopy("observation", "仅观察：仓位边界不允许至少一手，不执行买入或补仓。", reason="仓位不足")
         return GuardedCopy("actionable", text, quantity, float(invalidation_price), "买入条件已确认")
 
+    ledger_consistent = bool(_eligibility_value(eligibility, "ledger_consistent", True))
     sellable = int(_eligibility_value(eligibility, "sellable_quantity"))
-    if kind in {"risk_exit", "stop", "break_support"}:
+    if not ledger_consistent:
+        return GuardedCopy(
+            "observation",
+            "仅观察：持仓账本数量不一致，暂不生成可卖股数。",
+            reason="持仓账本不一致",
+        )
+    if kind in {"risk_exit", "risk_reduce", "stop", "break_support"}:
+        risk_confirmations = int(_evidence_value(evidence, "risk_confirmations", 0))
+        critical = bool(_evidence_value(evidence, "risk_level", "NORMAL") == "CRITICAL")
         risk_ready = bool(
             _valid_trade_date(trade_date)
             and _evidence_value(evidence, "risk_complete")
             and _evidence_value(evidence, "risk_confirmed")
+            and risk_confirmations >= 2
         )
-        if risk_ready and sellable > 0:
-            return GuardedCopy("actionable", text, sellable, 0.0, "风险卖出条件已确认")
+        full_exit_ready = bool(
+            kind == "risk_exit" and critical and risk_confirmations >= 3
+        )
+        if risk_ready and sellable > 0 and full_exit_ready:
+            quantity = int(max_quantity or sellable)
+            return GuardedCopy("actionable", text, min(quantity, sellable), 0.0, "历史结构失效且风险卖出条件已确认")
+        if risk_ready and sellable > 0 and kind == "risk_reduce":
+            quantity = int(max_quantity or max(100, ((sellable // 3) // 100) * 100))
+            return GuardedCopy("actionable", text, min(quantity, sellable), 0.0, "连续风险确认，首批分批减仓")
         if risk_ready:
             return GuardedCopy(
                 "next_day",
                 "风险事实：风险条件已确认，但当日无可卖批次；受A股T+1限制，下一交易日复核处置。",
                 reason="T+1限制",
             )
-        return GuardedCopy("risk_fact", "风险观察：风险条件尚未经新鲜15分钟K线确认，今日不作卖出处置。", reason="风险证据不足")
+        return GuardedCopy(
+            "risk_fact",
+            "风险观察：等待连续两根新鲜15分钟K线及历史风险级别确认，今日不作卖出处置。",
+            reason="风险证据不足",
+        )
 
     if kind in {"normal_exit", "exit", "resistance", "t_sell", "do_t"}:
         if not _valid_trade_date(trade_date):

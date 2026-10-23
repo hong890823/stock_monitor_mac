@@ -2,9 +2,13 @@
 # -*- coding: utf-8 -*-
 """盘中点火（量能突增 + 平台突破）测试。"""
 
+import sys
+import types
 import unittest
+from unittest.mock import Mock, patch
 
-from intraday_ignition import IgnitionSample, IgnitionTracker
+from intraday_ignition import IgnitionAlert, IgnitionSample, IgnitionTracker
+from stock_menubar import StockMenuBar
 
 T0 = 1_000_000.0
 STEP = 30.0            # 采样间隔
@@ -113,6 +117,66 @@ class IgnitionTrackerTests(unittest.TestCase):
         # 另一只票没有基线，不报——说明状态确实按 code 隔离
         self.assertIsNotNone(alert1)
         self.assertIsNone(alert2)
+
+
+class IgnitionNotificationTests(unittest.TestCase):
+    def test_ignition_popup_labels_market_event_not_risk(self):
+        app = object.__new__(StockMenuBar)
+        app.log = Mock()
+        app._notify = Mock(return_value=True)
+        dialogs = []
+
+        class FakeAlert:
+            def __init__(self):
+                self.message_text = None
+                self.informative_text = None
+
+            @classmethod
+            def alloc(cls):
+                return cls()
+
+            def init(self):
+                return self
+
+            def setMessageText_(self, text):
+                self.message_text = text
+
+            def setInformativeText_(self, text):
+                self.informative_text = text
+
+            def setAlertStyle_(self, _style):
+                pass
+
+            def addButtonWithTitle_(_self, _title):
+                pass
+
+            def runModal(self):
+                dialogs.append(self)
+
+        fake_appkit = types.SimpleNamespace(
+            NSAlert=FakeAlert,
+            NSAlertStyleCritical=2,
+            NSAlertStyleWarning=1,
+            NSAlertStyleInformational=0,
+        )
+        alert = IgnitionAlert(
+            code="sz002185",
+            name="华天科技",
+            price=14.40,
+            volume_ratio=4.2,
+            platform_top=14.15,
+        )
+
+        with patch.dict(sys.modules, {"AppKit": fake_appkit}):
+            app._notify_ignition(alert)
+
+        self.assertEqual(len(dialogs), 1)
+        self.assertEqual(
+            dialogs[0].message_text,
+            "【盘中异动】🔥 华天科技 盘中点火",
+        )
+        self.assertNotIn("风险", dialogs[0].informative_text)
+        self.assertIn("非买入指令", dialogs[0].informative_text)
 
 
 if __name__ == "__main__":

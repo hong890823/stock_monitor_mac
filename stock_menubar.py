@@ -50,6 +50,7 @@ from sector_leaders import (
     rank_leader_candidates,
 )
 from limit_seal_events import SealEventTracker, SealTick
+from limit_pool_client import fetch_pools
 from intraday_ignition import IgnitionSample, IgnitionTracker
 from alert_repeat_guard import AlertRepeatGuard
 from five_one_three import (
@@ -76,6 +77,8 @@ from portfolio_daily_report import (
 from deep_loss_policy import suggested_add_quantity
 from news_impact import NewsImpactService
 from intraday_bars import build_timeframe_evidence, fetch_intraday_bars
+from daily_risk_context import DailyRiskContextCache
+from intraday_volume_context import build_intraday_volume_context
 from intraday_trade_policy import (
     DecisionAction,
     PositionEligibility,
@@ -87,6 +90,14 @@ from market_timing import format_market_timing_data
 from market_cycle_policy import MarketCycleInput, assess_market_cycle, format_market_cycle_assessment
 from market_cycle_state import MarketCycleStateStore
 from menu_item_utils import replace_menu_item_title
+from menu_bar_window import (
+    MenuBarFallbackWindow,
+    build_summary,
+    build_watchlist_quotes,
+    native_menu_root,
+    order_main_menu,
+)
+from menu_update_coordinator import MenuUpdateCoordinator, observe_menu_tracking
 from stock_analysis import analyze_history, format_report
 from strong_continuation_policy import (
     StrongContinuationInput,
@@ -123,6 +134,15 @@ from observation_pool import ObservationPool
 from observation_alerts import ObservationEntryTracker, is_entry_session
 from quote_clock import parse_quote_clock
 from observation_ui import build_observation_view, decorate_stock, prioritize_stocks, indicator_color
+from selection_menu import build_selection_sections
+from market_news_client import fetch_today
+from news_digest_policy import select_headlines
+from today_headlines import (
+    TodayHeadlinesState,
+    format_headlines,
+    load_state,
+    save_state,
+)
 try:
     from entry_review_service import EntryReviewService
     _ENTRY_REVIEW_IMPORT_ERROR = None
@@ -158,20 +178,6 @@ try:
     NSApplication = objc.lookUpClass("NSApplication")
     _NSApp = None
     _HAS_OBJC = True
-    from AppKit import (
-        NSWindow, NSView, NSColor, NSTextView, NSFont,
-        NSFloatingWindowLevel, NSBorderlessWindowMask,
-        NSScreen, NSMakeRect, NSBackingStoreBuffered,
-        NSTextField, NSCenterTextAlignment,
-        NSBezelBorder, NSTimer, NSMutableAttributedString,
-        NSTableView, NSTableColumn, NSTableHeaderView,
-        NSTableViewSelectionHighlightStyleNone,
-        NSTextFieldCell, NSScrollView, NSButton,
-        NSScreenSaverWindowLevel,
-        NSWindowCollectionBehaviorCanJoinAllSpaces,
-        NSWindowCollectionBehaviorFullScreenAuxiliary,
-    )
-    from Foundation import NSMakeSize, NSMakeRange, NSObject
 except ImportError:
     _HAS_OBJC = False
 
@@ -187,6 +193,9 @@ def _get_ns_app():
 
 
 INDICATOR_API_LOCK = threading.Lock()
+SELECTION_MENU_TITLE = "📈 选股"
+PORTFOLIO_SETTINGS_TITLE = "⚙️ 持仓设置"
+SETTINGS_TITLE = "🔧 设置"
 
 # 系统级 socket 超时兜底：任何没显式带 timeout 的网络调用（含 akshare 内部、
 # urllib）最多阻塞 20 秒，避免一个挂死的连接把后台线程永久卡住（2026-09-30
@@ -195,6 +204,8 @@ socket.setdefaulttimeout(20)
 
 # urllib3 v2 在 LibreSSL 环境下的 OpenSSL 兼容性提示是纯噪音（每次启动灌进 crash.log）
 warnings.filterwarnings("ignore", message="urllib3 v2 only supports OpenSSL")
+
+PROXY_CONS_CAP = 8
 
 # akshare 不暴露 timeout，只能在调用期间临时接管 Session.request。
 # 补丁只安装一次，超时值放在 thread-local 里按线程取用，这样选股线程的超时
@@ -267,493 +278,6 @@ def calc_kdj(high, low, close, n=9, m1=3, m2=3):
     return k, d, j
 
 
-if _HAS_OBJC:
-    class _ClickView(NSView):
-        """透明覆盖层，区分点击（切换模式）与拖动（移动窗口）"""
-
-        def initWithFrame_(self, frame):
-            self = objc.super(_ClickView, self).initWithFrame_(frame)
-            if self is None:
-                return None
-            self._down = (0, 0)
-            self._callback = None
-            return self
-
-        def acceptsFirstMouse_(self, event):
-            return True
-
-        @objc.typedSelector(b'v@:@')
-        def mouseDown_(self, event):
-            loc = event.locationInWindow()
-            self._down = (loc.x, loc.y)
-
-        @objc.typedSelector(b'v@:@')
-        def mouseUp_(self, event):
-            loc = event.locationInWindow()
-            dx = loc.x - self._down[0]
-            dy = loc.y - self._down[1]
-            if dx * dx + dy * dy < 25:       # 移动 <5px 视为点击
-                if self._callback:
-                    self._callback()
-
-        def mouseDragged_(self, event):
-            pass                             # 不传递，避免干扰
-
-    class _FWTableViewDelegate(NSObject):
-        """表格点击回调代理"""
-
-        def init(self):
-            self = objc.super(_FWTableViewDelegate, self).init()
-            if self is None:
-                return None
-            self._callback = None
-            return self
-
-        def tableViewSelectionDidChange_(self, notification):
-            tv = notification.object()
-            row = tv.selectedRow()
-            if row >= 0 and self._callback:
-                self._callback(row)
-            tv.deselectAll_(None)
-
-    class _FWDataSource(NSObject):
-        """表格数据源，持有菜单项列表和着色回调"""
-
-        def init(self):
-            self = objc.super(_FWDataSource, self).init()
-            if self is None:
-                return None
-            self._items = []
-            self._color_fn = None
-            return self
-
-        def numberOfRowsInTableView_(self, tv):
-            return len(self._items)
-
-        def tableView_objectValueForTableColumn_row_(self, tv, col, row):
-            if row < len(self._items):
-                return self._items[row].get("label", "")
-            return ""
-
-        def tableView_willDisplayCell_forTableColumn_row_(self, tv, cell, col, row):
-            if self._color_fn and row < len(self._items):
-                self._color_fn(cell, self._items[row])
-
-# 板块等权代理指数每板块取几只成分股。8 只足够反映板块方向，
-# 再多就把「每天重建一次」的成本抬到分钟级。
-PROXY_CONS_CAP = 8
-
-
-class FloatingWindow:
-    """桌面浮动股票窗口，支持级联菜单导航
-
-    紧凑模式：点击展开菜单
-    菜单模式：可点击进入子菜单（板块→子板块），点击返回上级
-    """
-
-    WIDTH = 250
-    MENU_WIDTH = 320
-    PADDING = 14
-    CORNER_RADIUS = 12
-    ROW_HEIGHT = 28
-
-    def __init__(self, on_close=None, on_mode_change=None):
-        self._window = None
-        self._text_view = None
-        self._close_btn = None
-        self._click_view = None
-        self._table_view = None
-        self._table_delegate = None
-        self._visible = False
-        self._expanded = False        # False=紧凑  True=菜单模式
-        self._on_close = on_close
-        self._on_mode_change = on_mode_change
-        self._compact_text = ""
-        self._compact_colored = None
-        # 菜单数据：{section_key: {"title": ..., "items": [...]}}
-        self._menu_data = {}
-        self._menu_path = []          # 导航路径，如 ["sector", "top"]
-        self._menu_items = []         # 当前页面的项目列表
-        if _HAS_OBJC:
-            self._create_window()
-
-    # ========== 窗口构建 ==========
-    def _create_window(self):
-        screen = NSScreen.mainScreen()
-        frame = screen.visibleFrame()
-        w = self.MENU_WIDTH
-        x = frame.origin.x + frame.size.width - w - 16
-        y = frame.origin.y + frame.size.height - 120
-
-        self._window = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(x, y, w, 120),
-            NSBorderlessWindowMask,
-            NSBackingStoreBuffered,
-            False,
-        )
-        self._window.setLevel_(NSFloatingWindowLevel)
-        self._window.setOpaque_(False)
-        hud_color = NSColor.colorWithRed_green_blue_alpha_(0.055, 0.065, 0.085, 0.94)
-        # 窗口本身保持透明，避免矩形背景溢出圆角内容层。
-        self._window.setBackgroundColor_(NSColor.clearColor())
-        self._window.setHasShadow_(True)
-        self._window.setMovableByWindowBackground_(True)
-        self._window.setIgnoresMouseEvents_(False)
-        self._window.setTitlebarAppearsTransparent_(True)
-
-        content = self._window.contentView()
-        content.setWantsLayer_(True)
-        content.layer().setCornerRadius_(self.CORNER_RADIUS)
-        content.layer().setMasksToBounds_(True)
-        try:
-            content.layer().setBackgroundColor_(hud_color.CGColor())
-            content.layer().setBorderWidth_(1.0)
-            content.layer().setBorderColor_(
-                NSColor.colorWithRed_green_blue_alpha_(0.45, 0.55, 0.70, 0.32).CGColor()
-            )
-        except Exception:
-            pass
-
-        # 紧凑模式：文本 + 点击遮罩
-        self._click_view = _ClickView.alloc().initWithFrame_(
-            NSMakeRect(0, 0, w, 120)
-        )
-        self._click_view._callback = self._on_click
-
-        self._text_view = NSTextView.alloc().initWithFrame_(
-            NSMakeRect(self.PADDING, self.PADDING,
-                       w - 2 * self.PADDING, 96)
-        )
-        self._text_view.setEditable_(False)
-        self._text_view.setSelectable_(False)
-        self._text_view.setDrawsBackground_(False)
-        self._text_view.setFont_(NSFont.monospacedSystemFontOfSize_weight_(11.5, 0))
-        self._text_view.setTextColor_(NSColor.colorWithWhite_alpha_(0.94, 1.0))
-        self._text_view.setTextContainerInset_((5, 5))
-        content.addSubview_(self._text_view)
-        content.addSubview_(self._click_view)
-
-        # 菜单模式：表格 + 滚动视图（默认隐藏）
-        self._table_delegate = _FWTableViewDelegate.alloc().init()
-        self._table_delegate._callback = self._on_table_click
-
-        self._data_source = _FWDataSource.alloc().init()
-        self._data_source._color_fn = self._apply_cell_style
-
-        self._table_view = NSTableView.alloc().initWithFrame_(NSMakeRect(0, 0, w, 120))
-        self._table_view.setRowHeight_(self.ROW_HEIGHT)
-        self._table_view.setIntercellSpacing_((0, 0))
-        self._table_view.setSelectionHighlightStyle_(NSTableViewSelectionHighlightStyleNone)
-        self._table_view.setDelegate_(self._table_delegate)
-        self._table_view.setDataSource_(self._data_source)
-        self._table_view.setBackgroundColor_(NSColor.clearColor())
-
-        col = NSTableColumn.alloc().initWithIdentifier_("menu")
-        col.setWidth_(w)
-        cell = NSTextFieldCell.alloc().initTextCell_("")
-        cell.setFont_(NSFont.systemFontOfSize_(13))
-        cell.setTextColor_(NSColor.colorWithWhite_alpha_(0.94, 1.0))
-        cell.setLineBreakMode_(4)  # NSLineBreakByTruncatingTail
-        cell.setDrawsBackground_(False)
-        col.setDataCell_(cell)
-        self._table_view.addTableColumn_(col)
-        header = self._table_view.headerView()
-        if header:
-            header.setHidden_(True)
-
-        self._scroll_view = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, w, 120))
-        self._scroll_view.setDocumentView_(self._table_view)
-        self._scroll_view.setHasVerticalScroller_(True)
-        self._scroll_view.setDrawsBackground_(False)
-        self._scroll_view.setBackgroundColor_(NSColor.clearColor())
-        self._scroll_view.setBorderType_(0)  # no border
-        self._scroll_view.setAutohidesScrollers_(True)
-        self._scroll_view.setHidden_(True)
-        content.addSubview_(self._scroll_view)
-
-        # 关闭按钮（NSTextField 视觉 + _ClickView 点击，始终在最上层）
-        btn_size = 24
-        self._close_btn = NSTextField.alloc().initWithFrame_(
-            NSMakeRect(w - btn_size - 6, 0, btn_size, btn_size)
-        )
-        self._close_btn.setStringValue_("✕")
-        self._close_btn.setFont_(NSFont.systemFontOfSize_(13))
-        self._close_btn.setTextColor_(NSColor.colorWithWhite_alpha_(0.78, 1.0))
-        self._close_btn.setDrawsBackground_(True)
-        self._close_btn.setBackgroundColor_(NSColor.colorWithWhite_alpha_(0.22, 0.72))
-        self._close_btn.setBordered_(False)
-        self._close_btn.setEditable_(False)
-        self._close_btn.setSelectable_(False)
-        self._close_btn.setAlignment_(NSCenterTextAlignment)
-        self._close_btn.setWantsLayer_(True)
-        self._close_btn.layer().setCornerRadius_(btn_size / 2)
-        self._close_btn.layer().setMasksToBounds_(True)
-        content.addSubview_(self._close_btn)
-
-        # 按钮点击层（放在最上面，覆盖按钮区域）
-        self._close_click = _ClickView.alloc().initWithFrame_(
-            NSMakeRect(w - btn_size - 6, 0, btn_size, btn_size)
-        )
-        self._close_click._callback = self._on_close_btn
-        content.addSubview_(self._close_click)
-
-    # ========== 关闭按钮回调（隐藏窗口） ==========
-    def _on_close_btn(self):
-        self.hide()
-        if self._on_close:
-            self._on_close()
-
-    # ========== 紧凑模式点击 ==========
-    def _on_click(self):
-        self.toggle_mode()
-
-    def toggle_mode(self):
-        self._expanded = not self._expanded
-        if self._expanded:
-            self._enter_menu_mode()
-        else:
-            self._enter_compact_mode()
-        if self._on_mode_change:
-            self._on_mode_change()
-
-    # ========== 模式切换 ==========
-    def _enter_menu_mode(self):
-        """进入菜单模式"""
-        self._click_view.setHidden_(True)
-        self._text_view.setHidden_(True)
-        self._scroll_view.setHidden_(False)
-        self._menu_path = []
-        self._render_menu()
-
-    def _enter_compact_mode(self):
-        """回到紧凑模式"""
-        self._scroll_view.setHidden_(True)
-        self._click_view.setHidden_(False)
-        self._text_view.setHidden_(False)
-        self._render_compact()
-
-    # ========== 菜单数据设置 ==========
-    def set_menu_data(self, data):
-        """设置菜单数据。格式：
-        {"section_key": {"title": "显示名", "items": [
-            {"name": "名称", "value": "显示值", "color": "red/green/gray/white"},
-            ...
-        ]}}
-        """
-        self._menu_data = data
-        if self._expanded:
-            self._render_menu()
-
-    # ========== 菜单渲染 ==========
-    def _render_menu(self):
-        """根据当前导航路径渲染菜单页面"""
-        if not self._window:
-            return
-        items = []
-
-        if not self._menu_path:
-            # 根页面：列出所有 section
-            for key, sec in self._menu_data.items():
-                count = len(sec.get("items", []))
-                if count > 0:
-                    items.append({
-                        "type": "nav", "target": key,
-                        "label": f"  {sec['title']}  ·  {count}",
-                        "color": "blue",
-                    })
-            if not items:
-                items.append({"type": "info", "label": "  暂无可用数据 · 等待刷新", "color": "gray"})
-            # 根页面顶部加标题和「收起」回到紧凑模式
-            items.insert(0, {"type": "collapse", "label": "  ← 收起浮窗", "color": "gray"})
-            items.insert(1, {"type": "header", "label": "  📈 A股实时监控", "color": "header"})
-        else:
-            # 子页面：显示 section 的 items
-            section_key = self._menu_path[0]
-            sub_key = self._menu_path[1] if len(self._menu_path) > 1 else None
-            sec = self._menu_data.get(section_key, {})
-            raw_items = sec.get("items", [])
-
-            if sub_key and isinstance(raw_items, dict):
-                raw_items = raw_items.get(sub_key, [])
-
-            for it in raw_items:
-                items.append({
-                    "type": "info",
-                    "label": f"  {it['name']}    {it['value']}",
-                    "color": it.get("color", "white"),
-                })
-            if not items:
-                items.append({"type": "info", "label": "  暂无数据 · 等待下一次刷新", "color": "gray"})
-
-        self._menu_items = items
-
-        # 需要在 items 前面加一行「← 返回」（非根页面时）
-        display_items = list(items)
-        if self._menu_path:
-            display_items.insert(0, {
-                "type": "back",
-                "label": "  ← 返回",
-                "color": "white",
-            })
-
-        self._data_source._items = display_items
-        self._table_view.reloadData()
-        self._resize_window(len(display_items) + 1, self.MENU_WIDTH)
-
-    # ========== 单元格着色 ==========
-    def _apply_cell_style(self, cell, item):
-        colors = {
-            "red": NSColor.colorWithRed_green_blue_alpha_(0.98, 0.38, 0.42, 1.0),
-            "green": NSColor.colorWithRed_green_blue_alpha_(0.35, 0.88, 0.52, 1.0),
-            "gray": NSColor.colorWithWhite_alpha_(0.62, 1.0),
-            "white": NSColor.colorWithWhite_alpha_(0.94, 1.0),
-            "blue": NSColor.colorWithRed_green_blue_alpha_(0.58, 0.75, 1.0, 1.0),
-            "header": NSColor.colorWithRed_green_blue_alpha_(0.70, 0.84, 1.0, 1.0),
-        }
-        cell.setTextColor_(colors.get(item.get("color", "white"), colors["white"]))
-        if item["type"] == "header":
-            cell.setFont_(NSFont.boldSystemFontOfSize_(12.5))
-        elif item["type"] == "nav":
-            cell.setFont_(NSFont.boldSystemFontOfSize_(12.5))
-        elif item["type"] in ("back", "collapse"):
-            cell.setFont_(NSFont.systemFontOfSize_(11.5))
-        else:
-            cell.setFont_(NSFont.monospacedSystemFontOfSize_weight_(12, 0))
-
-    # ========== 表格点击 → 导航 ==========
-    def _on_table_click(self, row):
-        items = self._data_source._items
-        if row < 0 or row >= len(items):
-            return
-        item = items[row]
-        if item["type"] == "collapse":
-            self.toggle_mode()       # 回到紧凑模式
-        elif item["type"] == "back":
-            self._menu_path = []
-            self._render_menu()
-        elif item["type"] == "nav":
-            self._menu_path = [item["target"]]
-            self._render_menu()
-
-    # ========== 公共接口 ==========
-    def set_compact(self, text, colored=None):
-        """设置紧凑模式内容"""
-        self._compact_text = text
-        self._compact_colored = colored
-        if not self._expanded:
-            self._render_compact()
-
-    def update(self, text, colored_lines=None):
-        """兼容旧接口"""
-        self.set_compact(text, colored_lines)
-
-    @property
-    def expanded(self):
-        return self._expanded
-
-    @staticmethod
-    def _utf16_length(value):
-        """返回 NSString/NSAttributedString 使用的 UTF-16 单元长度。"""
-        return len(value.encode("utf-16-le")) // 2
-
-    def _render_compact(self):
-        text = self._compact_text
-        colored_lines = self._compact_colored
-        if not self._window or not text:
-            return
-        try:
-            colors = {
-                "red": NSColor.colorWithRed_green_blue_alpha_(0.98, 0.38, 0.42, 1.0),
-                "green": NSColor.colorWithRed_green_blue_alpha_(0.35, 0.88, 0.52, 1.0),
-                "gray": NSColor.colorWithWhite_alpha_(0.62, 1.0),
-                "white": NSColor.colorWithWhite_alpha_(0.94, 1.0),
-                "header": NSColor.colorWithRed_green_blue_alpha_(0.70, 0.84, 1.0, 1.0),
-            }
-            attr_str = NSMutableAttributedString.alloc().initWithString_(text)
-            full_range = NSMakeRange(0, self._utf16_length(text))
-            attr_str.addAttribute_value_range_(
-                "NSFont", NSFont.monospacedSystemFontOfSize_weight_(11.5, 0), full_range
-            )
-            attr_str.addAttribute_value_range_(
-                "NSColor", colors["white"], full_range
-            )
-            if colored_lines:
-                search_offset = 0
-                for line, cname in colored_lines:
-                    idx = text.find(line, search_offset)
-                    if idx >= 0:
-                        start = self._utf16_length(text[:idx])
-                        length = self._utf16_length(line)
-                        c = colors.get(cname, NSColor.whiteColor())
-                        attr_str.addAttribute_value_range_(
-                            "NSColor", c, NSMakeRange(start, length)
-                        )
-                        search_offset = idx + len(line)
-            self._text_view.textStorage().setAttributedString_(attr_str)
-            self._resize_window(text.count('\n') + 2, self.WIDTH)
-        except Exception:
-            pass
-
-    def _resize_window(self, line_count, width):
-        """统一调整窗口大小"""
-        h = max(88, line_count * self.ROW_HEIGHT + self.PADDING * 2)
-        screen_h = NSScreen.mainScreen().visibleFrame().size.height
-        h = min(h, screen_h - 80)
-        frame = self._window.frame()
-        new_x = frame.origin.x + frame.size.width - width
-        self._window.setFrame_display_(
-            NSMakeRect(new_x, frame.origin.y + frame.size.height - h, width, h), True
-        )
-        self._text_view.setFrame_(
-            NSMakeRect(self.PADDING, self.PADDING,
-                       width - 2 * self.PADDING, h - 2 * self.PADDING)
-        )
-        # 表格内容高度（可能超出窗口，由 scroll view 处理滚动）
-        content_h = line_count * self.ROW_HEIGHT
-        self._table_view.setFrame_(NSMakeRect(0, 0, width - 14, content_h))
-        col = self._table_view.tableColumns()[0] if self._table_view.numberOfColumns() > 0 else None
-        if col:
-            col.setWidth_(width - 14)
-        if self._scroll_view:
-            self._scroll_view.setFrame_(NSMakeRect(0, 0, width, h))
-        if self._click_view:
-            self._click_view.setFrame_(NSMakeRect(0, 0, width, h))
-        # 关闭按钮始终在右上角
-        btn_size = 24
-        btn_x = width - btn_size - 6
-        btn_y = h - btn_size - 4
-        if self._close_btn:
-            self._close_btn.setFrame_(NSMakeRect(btn_x, btn_y, btn_size, btn_size))
-        if self._close_click:
-            self._close_click.setFrame_(NSMakeRect(btn_x, btn_y, btn_size, btn_size))
-
-    # ========== 显隐 ==========
-    def show(self):
-        if self._window:
-            self._window.orderFront_(None)
-            self._visible = True
-
-    def hide(self):
-        if self._window:
-            self._window.orderOut_(None)
-            self._visible = False
-
-    def toggle_visible(self):
-        if self._visible:
-            self.hide()
-        else:
-            self.show()
-
-    @property
-    def visible(self):
-        return self._visible
-
-    def close(self):
-        if self._window:
-            self._window.close()
-            self._window = None
-
-
 class StockMenuBar(rumps.App):
     _SUMMARY_TIMEOUT = 90  # 盘面总结总超时（秒）
 
@@ -807,6 +331,15 @@ class StockMenuBar(rumps.App):
         self.observation_pool_file = os.path.join(
             self.log_dir, "screen_observation_state.json"
         )
+        self.today_headlines_file = os.path.join(
+            self.log_dir, "today_headlines.json"
+        )
+        self._today_headlines_report_file = os.path.join(
+            self.log_dir, "_today_headlines.txt"
+        )
+        self._today_headlines_state = load_state(self.today_headlines_file)
+        self._today_headlines_lock = threading.Lock()
+        self._today_headlines_refreshing = False
         self._instance_lock_handle = self._acquire_instance_lock()
         self._log_lock = threading.Lock()
 
@@ -851,6 +384,7 @@ class StockMenuBar(rumps.App):
         self._last_portfolio_results = []
         self._t_filter_events = {}
         self._signal_confidence = SignalConfidence()
+        self._daily_risk_context_cache = DailyRiskContextCache()
         # 板块龙头：封板/炸板分档，用来抑制或恢复冲高做T（见 sector_leaders.py）
         self.sector_leaders_file = os.path.join(self.log_dir, "sector_leaders.json")
         self._leader_store = SectorLeaderStore(self.sector_leaders_file)
@@ -1023,15 +557,18 @@ class StockMenuBar(rumps.App):
         self._kline_fail_cache = None   # K线失败缓存（5分钟内不重试）
         self._kline_fail_time = None
 
-        # 浮动窗口
-        self.floating_window = FloatingWindow(
-            on_close=self._on_floating_closed,
-            on_mode_change=self._on_floating_mode_change,
+        # 刘海屏替代入口：只展示摘要并弹出当前原生菜单
+        self._screen_observer = None
+        self._menu_tracking_observers = []
+        self._menu_update_coordinator = MenuUpdateCoordinator(self._refresh_menu_display)
+        self.menu_bar_fallback = MenuBarFallbackWindow(
+            menu_provider=lambda: native_menu_root(self),
+            state_path=os.path.join(self.log_dir, "menu_bar_window.json"),
+            on_error=lambda error: self.log(f"菜单替代窗口错误: {error}", "ERROR"),
         )
-        self.floating_window.show()
 
-        self.indicator_menu = rumps.MenuItem("📈 指标策略", callback=None)
-        self.indicator_menu.add(rumps.MenuItem("⏳ 加载指标策略…", callback=None))
+        self.selection_menu = rumps.MenuItem(SELECTION_MENU_TITLE, callback=None)
+        self.selection_menu.add(rumps.MenuItem("⏳ 加载选股结果…", callback=None))
 
         self.limit_menu = rumps.MenuItem("📊 涨跌停", callback=None)
         self.limit_menu.add(rumps.MenuItem("⏳ 加载中…", callback=None))
@@ -1047,6 +584,18 @@ class StockMenuBar(rumps.App):
 
         self._market_overview_menu_item = rumps.MenuItem(
             "📊 市场概览", callback=None
+        )
+        self._watchlist_menu_item = rumps.MenuItem(
+            "📈 监控股票", callback=None
+        )
+        self._today_headlines_menu_item = rumps.MenuItem(
+            "📰 今日要闻", callback=self.show_today_headlines
+        )
+        self._today_headlines_menu_item.add(
+            rumps.MenuItem("📄 查看全部要闻", callback=self.show_today_headlines)
+        )
+        self._today_headlines_menu_item.add(
+            rumps.MenuItem("🔄 刷新今日要闻", callback=self.refresh_today_headlines_now)
         )
         self._summary_menu_item = rumps.MenuItem(
             "📋 盘面总结", callback=self.show_market_summary
@@ -1072,7 +621,7 @@ class StockMenuBar(rumps.App):
             rumps.MenuItem("📄 打开完整报告", callback=self.show_daily_report)
         )
         self._portfolio_settings_menu_item = rumps.MenuItem(
-            "⚙️ 持仓设置", callback=None
+            PORTFOLIO_SETTINGS_TITLE, callback=None
         )
         self._portfolio_settings_menu_item.add(
             rumps.MenuItem("➕ 追加监控股票", callback=self.show_portfolio_add)
@@ -1102,7 +651,7 @@ class StockMenuBar(rumps.App):
         self._refresh_sector_leader_menu()
 
         # 设置菜单
-        self._settings_menu = rumps.MenuItem("⚙️ 设置", callback=None)
+        self._settings_menu = rumps.MenuItem(SETTINGS_TITLE, callback=None)
         self._settings_menu.add(
             rumps.MenuItem("🔔 测试通知", callback=self.test_notification)
         )
@@ -1110,37 +659,36 @@ class StockMenuBar(rumps.App):
             rumps.MenuItem("📊 测试盘中信号", callback=self.test_intraday_signals)
         )
 
-        # 浮动窗口菜单项
-        self._float_menu_item = rumps.MenuItem("📌 浮动窗口", callback=self._toggle_floating)
-
         # 创建菜单
-        self.menu = [
-            self._market_overview_menu_item,
-            None,  # 分隔线
-            self.top_sector_menu,
-            self.bottom_sector_menu,
-            self.concept_menu,
-            self.limit_menu,
-            self._summary_menu_item,
-            self.indicator_menu,
-            self._technical_analysis_menu_item,
-            self._fundamentals_menu_item,
-            self._global_menu_item,
-            self._ai_menu_item,
-            self._portfolio_info_menu_item,
-            self._portfolio_settings_menu_item,
-            self._trade_calculator_menu_item,
-            self._target_cost_menu_item,
-            self._sector_leader_menu_item,
-            self._settings_menu,
-            None,  # 分隔线
-            self._float_menu_item,
-            rumps.MenuItem("➕ 添加股票", callback=self.add_stock_dialog),
-            rumps.MenuItem("➖ 删除股票", callback=self.delete_stock_dialog),
-            rumps.MenuItem("🔄 立即刷新", callback=self.refresh_now),
-            None,  # 分隔线
-            rumps.MenuItem("❌ 退出", callback=self.quit_app),
-        ]
+        self.menu = order_main_menu({
+            "market": self._market_overview_menu_item,
+            "watchlist": self._watchlist_menu_item,
+            "top_sector": self.top_sector_menu,
+            "bottom_sector": self.bottom_sector_menu,
+            "concept": self.concept_menu,
+            "limit": self.limit_menu,
+            "selection": self.selection_menu,
+            "technical": self._technical_analysis_menu_item,
+            "fundamentals": self._fundamentals_menu_item,
+            "global": self._global_menu_item,
+            "ai": self._ai_menu_item,
+            "portfolio_info": self._portfolio_info_menu_item,
+            "portfolio_settings": self._portfolio_settings_menu_item,
+            "sector_leaders": self._sector_leader_menu_item,
+            "trade_calculator": self._trade_calculator_menu_item,
+            "target_cost": self._target_cost_menu_item,
+            "summary": self._summary_menu_item,
+            "headlines": self._today_headlines_menu_item,
+            "settings": self._settings_menu,
+            "add": rumps.MenuItem("➕ 添加股票", callback=self.add_stock_dialog),
+            "remove": rumps.MenuItem("➖ 删除股票", callback=self.delete_stock_dialog),
+            "refresh": rumps.MenuItem("🔄 立即刷新", callback=self.refresh_now),
+            "quit": rumps.MenuItem("❌ 退出", callback=self.quit_app),
+        })
+
+        self._setup_menu_tracking_observer()
+        self._setup_screen_observer()
+        self.menu_bar_fallback.evaluate_screen()
 
         # 启动定时更新
         self.start_update_timer()
@@ -1944,30 +1492,39 @@ class StockMenuBar(rumps.App):
             result.append(row)
         return result
 
-    def get_limit_stocks(self):
-        """获取涨跌停个股（新浪hq批量接口），按所属板块归类
+    def get_limit_stocks(self, at=None):
+        """获取涨跌停个股，东财涨跌停池优先，失败时回退新浪扫描
         失败或结果为0时保留上次有效数据
         """
         try:
-            limit_up, limit_down = [], []
+            limit_up, limit_down, source = [], [], "EASTMONEY_LIMIT_POOL"
+            try:
+                pools = fetch_pools(at or datetime.now())
+                limit_up = list(pools.get("up") or [])
+                limit_down = list(pools.get("down") or [])
+                if not limit_up and not limit_down:
+                    raise ValueError("东财涨跌停池为空")
+            except Exception as error:
+                source = "SINA_SCAN"
+                self.log(f"东财涨跌停池失败，回退新浪扫描：{error}", "WARNING")
 
-            for prefix, start, end in self._SINA_CODE_RANGES:
-                batch_size = 800
-                for i in range(start, end, batch_size):
-                    codes = [f"{prefix}{c:06d}" for c in range(i, min(i + batch_size, end))]
-                    try:
-                        stocks = self._sina_batch_quote(codes)
-                    except Exception:
-                        continue
-                    for s in stocks:
-                        name = s['name']
-                        if 'ST' in name or '退' in name or 'N ' in name:
+                for prefix, start, end in self._SINA_CODE_RANGES:
+                    batch_size = 800
+                    for i in range(start, end, batch_size):
+                        codes = [f"{prefix}{c:06d}" for c in range(i, min(i + batch_size, end))]
+                        try:
+                            stocks = self._sina_batch_quote(codes)
+                        except Exception:
                             continue
-                        lim = self._limit_pct_for(s['code'])
-                        if s['pct'] >= lim - 0.15:
-                            limit_up.append(s)
-                        elif s['pct'] <= -lim + 0.15:
-                            limit_down.append(s)
+                        for s in stocks:
+                            name = s['name']
+                            if 'ST' in name or '退' in name or 'N ' in name:
+                                continue
+                            lim = self._limit_pct_for(s['code'])
+                            if s['pct'] >= lim - 0.15:
+                                limit_up.append(dict(s, source="SINA_SCAN"))
+                            elif s['pct'] <= -lim + 0.15:
+                                limit_down.append(dict(s, source="SINA_SCAN"))
 
             if not limit_up and not limit_down:
                 self.log("涨跌停：结果为0，可能非交易时段，保留上次数据", "INFO")
@@ -1988,12 +1545,13 @@ class StockMenuBar(rumps.App):
                 for b in boards:
                     down_boards.setdefault(b, []).append(s['name'])
 
-            self.log(f"涨跌停统计（新浪）：涨停{len(limit_up)}只，跌停{len(limit_down)}只")
+            self.log(f"涨跌停统计（{source}）：涨停{len(limit_up)}只，跌停{len(limit_down)}只")
             return {
                 'up': sorted(limit_up, key=lambda x: x['pct'], reverse=True),
                 'down': sorted(limit_down, key=lambda x: x['pct']),
                 'up_boards': dict(sorted(up_boards.items(), key=lambda x: len(x[1]), reverse=True)),
                 'down_boards': dict(sorted(down_boards.items(), key=lambda x: len(x[1]), reverse=True)),
+                'source': source,
             }
 
         except Exception as e:
@@ -3418,10 +2976,118 @@ class StockMenuBar(rumps.App):
             return rows, 0
         return rows[:limit], len(rows) - limit
 
+    def _refresh_today_headlines(self, at=None, force=False, fetcher=None):
+        now = at or datetime.now()
+        state = getattr(self, "_today_headlines_state", None)
+        if state is None:
+            state = TodayHeadlinesState()
+            self._today_headlines_state = state
+        if not force and not state.should_refresh(now):
+            return state
+        with self._today_headlines_lock:
+            if self._today_headlines_refreshing:
+                return state
+            self._today_headlines_refreshing = True
+        state.refresh_started(now)
+        try:
+            items = fetch_today(now, fetcher=fetcher)
+            state.refresh_succeeded(items, now)
+            self.log(f"今日要闻刷新完成：{len(items)}条", "INFO")
+        except Exception as error:
+            state.refresh_failed(str(error), now)
+            self.log(f"今日要闻刷新失败，保留上次有效结果：{error}", "WARNING")
+        finally:
+            self._today_headlines_refreshing = False
+            try:
+                save_state(self.today_headlines_file, state)
+            except Exception as error:
+                self.log(f"今日要闻缓存保存失败：{error}", "WARNING")
+        return state
+
+    def maybe_refresh_today_headlines(self, now=None, force=False):
+        now = now or datetime.now()
+        state = getattr(self, "_today_headlines_state", None)
+        if state is None:
+            state = load_state(getattr(self, "today_headlines_file", ""))
+            self._today_headlines_state = state
+        if force or state.should_refresh(now):
+            threading.Thread(
+                target=self._refresh_today_headlines,
+                kwargs={"at": now, "force": force},
+                daemon=True,
+            ).start()
+
+    def today_headlines_text(self, detail=False):
+        state = getattr(self, "_today_headlines_state", TodayHeadlinesState())
+        now = datetime.now()
+        items = state.display_items(now)
+        selection = select_headlines(items, now)
+        text = format_headlines(selection, state.updated_at, detail=detail)
+        if state.error and not items:
+            text += f"\n最近刷新失败：{state.error}"
+        return text
+
+    def refresh_today_headlines_now(self, _):
+        self.maybe_refresh_today_headlines(force=True)
+
+    def show_today_headlines(self, _):
+        text = self.today_headlines_text(detail=True)
+        try:
+            with open(self._today_headlines_report_file, "w", encoding="utf-8") as handle:
+                handle.write(text)
+            subprocess.Popen(
+                ["open", "-a", "TextEdit", self._today_headlines_report_file],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as error:
+            self.log(f"显示今日要闻失败：{error}", "ERROR")
+            self._alert(title="📰 今日要闻", message=text[:500])
+
+    def update_today_headlines_menu(self):
+        menu_item = getattr(self, "_today_headlines_menu_item", None)
+        if menu_item is None:
+            return
+        menu_item.clear()
+        state = getattr(self, "_today_headlines_state", TodayHeadlinesState())
+        items = state.display_items(datetime.now())
+        selection = select_headlines(items, datetime.now())
+        if selection.card:
+            for selected in selection.card:
+                item = selected.item
+                menu_item.add(rumps.MenuItem(
+                    f"[{selected.category.label}] {item.title}｜{item.publisher_source}",
+                    callback=None,
+                ))
+        else:
+            menu_item.add(rumps.MenuItem("暂无今日可用要闻", callback=None))
+        menu_item.add(rumps.MenuItem("📄 查看全部要闻", callback=self.show_today_headlines))
+        menu_item.add(rumps.MenuItem("🔄 刷新今日要闻", callback=self.refresh_today_headlines_now))
+
+    def selection_section_titles(self):
+        """构建选股菜单中的当前晋级状态与今日历史提醒。"""
+        observation_pool = getattr(self, "observation_pool", None)
+        records = getattr(observation_pool, "records", {}) if observation_pool else {}
+        sections = build_selection_sections(records, datetime.now(), per_group=8)
+        groups = (
+            ("🎯 已晋级 / 买点已确认", sections.promoted, sections.promoted_count),
+            ("🟡 日线候选 / 等待确认", sections.near_entry, sections.near_entry_count),
+            ("⚪ 持续观察", sections.observing, sections.observing_count),
+            ("📋 今日提醒记录", sections.today_alerts, sections.today_alert_count),
+        )
+        titles = []
+        for label, rows, count in groups:
+            suffix = "（历史记录，非当前买点）" if label.startswith("📋") else ""
+            titles.append(f"{label} · {count}只{suffix}")
+            titles.extend(rows)
+            if len(rows) < count:
+                titles.append(f"  …其余 {count - len(rows)} 只，完整名单见完整报告")
+        return titles
+
     def indicator_menu_titles(self):
-        """构建指标策略子菜单的逐行内容"""
+        """构建选股菜单中的严格、宽松与 513 原始扫描结果。"""
         view = build_observation_view(getattr(self, "observation_pool", None), datetime.now())
-        titles = view["focus_lines"] + [f"状态  ·  {self.indicator_refresh_status()}"]
+        titles = [f"状态  ·  {self.indicator_refresh_status()}"]
 
         titles.append(f"第一档 · 严格策略（{len(self.indicator_data)}只）")
         if self.indicator_data:
@@ -3489,12 +3155,6 @@ class StockMenuBar(rumps.App):
         if self.indicator_results_stale:
             stale_at = self.indicator_results_stale_at.strftime('%m-%d %H:%M') if self.indicator_results_stale_at else '最近一次刷新'
             titles.append(f"提示  ·  本次无新命中，保留{stale_at}结果")
-
-        observation_pool = getattr(self, "observation_pool", None)
-        if observation_pool is not None:
-            titles.append("  逐日记录与淘汰原因见「🔎 持续观察池」子菜单")
-            if getattr(self, "_observation_last_error", None):
-                titles.append(f"观察池复核提示：{self._observation_last_error}")
 
         if self._last_intraday_indicator_at:
             titles.append(
@@ -3585,48 +3245,44 @@ class StockMenuBar(rumps.App):
         # 空行保持菜单宽度
         self.limit_menu.add(rumps.MenuItem("                                        ", callback=None))
 
-    def update_indicator_menu(self):
-        """将指标策略结果逐行写入子菜单；顶部是两套刷新的入口（盘中不自动扫描）。"""
-        indicator_menu = self.menu["📈 指标策略"]
-        indicator_menu.clear()
-        titles = self.indicator_menu_titles()
-        focus_end = next((index for index, title in enumerate(titles) if title.startswith("状态  ·")), 0)
-        for title in titles[:focus_end]:
-            indicator_menu.add(rumps.MenuItem(title, callback=None))
-        if focus_end:
-            indicator_menu.add(rumps.separator)
-        indicator_menu.add(rumps.MenuItem("🔄 重扫指标（前200，秒级）", callback=self.scan_indicators_now))
-        indicator_menu.add(rumps.MenuItem("🔭 深扫全市场（趋势+513）", callback=self.scan_patterns_now))
+    def update_selection_menu(self):
+        """将当前晋级、历史提醒、直接操作和原始扫描结果平铺到一级菜单。"""
+        selection_menu = self.menu[SELECTION_MENU_TITLE]
+        selection_menu.clear()
+        for title in self.selection_section_titles():
+            selection_menu.add(rumps.MenuItem(title, callback=None))
+        selection_menu.add(rumps.separator)
+        selection_menu.add(rumps.MenuItem("🔄 重扫选股（前200，秒级）", callback=self.scan_indicators_now))
+        selection_menu.add(rumps.MenuItem("🔭 深扫全市场（趋势+513）", callback=self.scan_patterns_now))
         if getattr(self, "observation_pool", None) is not None:
-            pool_menu = rumps.MenuItem("🔎 持续观察池", callback=None)
-            pool_menu.add(rumps.MenuItem("🔄 立即复核观察池", callback=self.review_observation_pool_now))
-            pool_menu.add(rumps.MenuItem("📋 查看完整观察报告", callback=self.show_observation_pool_report))
-            pool_menu.add(rumps.MenuItem("🔔 盘中买点提醒已开启：回踩企稳 + 连续资金确认", callback=None))
-            pool_menu.add(rumps.MenuItem("至少3次/跨2分钟确认；同股每天一次", callback=None))
+            selection_menu.add(rumps.MenuItem("🔄 立即复核观察池", callback=self.review_observation_pool_now))
+            selection_menu.add(rumps.MenuItem("📋 查看完整观察报告", callback=self.show_observation_pool_report))
+            selection_menu.add(rumps.MenuItem("🔔 盘中买点提醒已开启：回踩企稳 + 连续资金确认", callback=None))
+            selection_menu.add(rumps.MenuItem("至少3次/跨2分钟确认；同股每天一次", callback=None))
             review = getattr(self, "_entry_review", None)
             if review is not None:
-                pool_menu.add(rumps.MenuItem("📒 查看买点复盘报告", callback=self.show_entry_review_report))
-                pool_menu.add(rumps.MenuItem("🔄 后台更新买点复盘", callback=self.refresh_entry_review_now))
+                selection_menu.add(rumps.MenuItem("📒 查看买点复盘报告", callback=self.show_entry_review_report))
+                selection_menu.add(rumps.MenuItem("🔄 后台更新买点复盘", callback=self.refresh_entry_review_now))
                 toggle_title = "⏸ 暂停买点复盘（选股提醒继续）" if review.enabled else "▶ 恢复买点复盘"
-                pool_menu.add(rumps.MenuItem(toggle_title, callback=self.toggle_entry_review))
-                pool_menu.add(rumps.MenuItem(review.status, callback=None))
+                selection_menu.add(rumps.MenuItem(toggle_title, callback=self.toggle_entry_review))
+                selection_menu.add(rumps.MenuItem(review.status, callback=None))
             if getattr(self, "_entry_review_error", None):
-                pool_menu.add(rumps.MenuItem(f"复盘模块提示：{self._entry_review_error}", callback=None))
-            for title in self.observation_pool.menu_lines(at=datetime.now()):
-                pool_menu.add(rumps.MenuItem(title, callback=None))
+                selection_menu.add(rumps.MenuItem(f"复盘模块提示：{self._entry_review_error}", callback=None))
             if self._observation_last_error:
-                pool_menu.add(rumps.MenuItem(f"复核提示：{self._observation_last_error}", callback=None))
+                selection_menu.add(rumps.MenuItem(f"复核提示：{self._observation_last_error}", callback=None))
             if getattr(self, "_observation_entry_last_error", None):
-                pool_menu.add(rumps.MenuItem(f"提醒检测提示：{self._observation_entry_last_error}", callback=None))
-            indicator_menu.add(pool_menu)
-        # rumps.MenuItem.separator() 不存在（本机 rumps 是 rumps.separator 哨兵）；
-        # 这里曾经抛 AttributeError，导致下面的指标结果永远加不进菜单（2026-10-12）。
-        indicator_menu.add(rumps.separator)
-        for title in titles[focus_end:]:
-            indicator_menu.add(rumps.MenuItem(title, callback=None))
+                selection_menu.add(rumps.MenuItem(f"提醒检测提示：{self._observation_entry_last_error}", callback=None))
+        # rumps.MenuItem.separator() 不存在（本机 rumps 是 rumps.separator 哨兵）。
+        selection_menu.add(rumps.separator)
+        for title in self.indicator_menu_titles():
+            selection_menu.add(rumps.MenuItem(title, callback=None))
+
+    def update_indicator_menu(self):
+        """兼容旧调用，实际入口已改为选股。"""
+        self.update_selection_menu()
 
     def _build_menu_data(self):
-        """构建统一的菜单数据结构，供下拉菜单和浮动窗口共用"""
+        """构建统一的菜单数据结构，供原生菜单和替代窗口摘要共用"""
         sections = {}
 
         # 1. 指数
@@ -3659,6 +3315,14 @@ class StockMenuBar(rumps.App):
                     "pct": d['change_pct'],
                 })
         sections["stock"] = {"title": "📈 个股", "items": stk_items}
+
+        watch_items = build_watchlist_quotes(
+            self.watchlist,
+            self.portfolio.get("positions", []),
+            self.stock_data,
+            include_missing=True,
+        )
+        sections["watchlist"] = {"title": "📈 监控股票", "items": watch_items}
 
         # 3. 涨幅榜
         top = []
@@ -3701,12 +3365,13 @@ class StockMenuBar(rumps.App):
             })
         sections["limit"] = {"title": "📊 涨跌停", "items": limit_items}
 
-        # 7. 指标策略
+        # 7. 选股
         view = build_observation_view(getattr(self, "observation_pool", None), datetime.now())
         sections["indicator"] = {
-            "title": f"📈 指标策略 · 📋 今日曾提醒{view['buy_count']} · 🟡 日线候选{view['ready_count']}",
+            "title": f"{SELECTION_MENU_TITLE} · 📋 今日曾提醒{view['buy_count']} · 🟡 日线候选{view['ready_count']}",
             "buy_count": view["buy_count"],
-            "items": self.indicator_menu_titles(),
+            "ready_count": view["ready_count"],
+            "items": self.selection_section_titles() + self.indicator_menu_titles(),
         }
 
         # 8. 盘面总结
@@ -3752,9 +3417,21 @@ class StockMenuBar(rumps.App):
         self._portfolio_info_menu_item.add(rumps.MenuItem(" " * 40, callback=None))
 
     def update_display(self):
-        """更新菜单栏显示 + 浮动窗口"""
+        """请求更新菜单；菜单展开时延迟到菜单关闭后统一刷新。"""
+        coordinator = getattr(self, "_menu_update_coordinator", None)
+        if coordinator is None:
+            self._refresh_menu_display()
+        else:
+            coordinator.request_update()
+
+    def _refresh_menu_display(self):
+        """更新菜单栏显示 + 刘海屏替代窗口摘要"""
         try:
             menu = self._build_menu_data()
+            try:
+                self.update_today_headlines_menu()
+            except Exception as error:
+                self.log(f"今日要闻菜单更新失败：{error}", "WARNING")
 
             # ── 菜单栏标题（show_in_bar 的股票） ──
             try:
@@ -3792,6 +3469,46 @@ class StockMenuBar(rumps.App):
                         f"指数菜单更新失败: 标题写入 {e}\n{traceback.format_exc()}",
                         "ERROR",
                     )
+
+            # ── 📈 监控股票 ──
+            try:
+                watch_items = menu.get("watchlist", {}).get("items", [])
+                watchlist_menu = rumps.MenuItem("📈 监控股票", callback=None)
+                if not watch_items:
+                    watchlist_menu.add(
+                        rumps.MenuItem("暂无监控股票", callback=None)
+                    )
+                else:
+                    for item in watch_items:
+                        pct = item.get("pct", 0)
+                        arrow = "▲" if pct > 0 else "▼" if pct < 0 else "─"
+                        quote = (
+                            f"{item.get('price', 0):.2f}  {arrow}{abs(pct):.2f}%"
+                            if item.get("available", True)
+                            else "等待行情"
+                        )
+                        watchlist_menu.add(rumps.MenuItem(
+                            f"{item.get('name', '')}  {quote}  "
+                            f"[{'/'.join(item.get('groups', []))}]",
+                            callback=lambda sender, code=item.get("code"), name=item.get("name"): (
+                                self.show_watchlist_stock(sender, code, name)
+                            ),
+                        ))
+                root_menu = native_menu_root(self)
+                old_native_item = self._watchlist_menu_item._menuitem
+                old_index = root_menu.indexOfItem_(old_native_item)
+                if old_index >= 0:
+                    root_menu.removeItemAtIndex_(old_index)
+                    root_menu.insertItem_atIndex_(watchlist_menu._menuitem, old_index)
+                else:
+                    root_menu.addItem_(watchlist_menu._menuitem)
+                self._watchlist_menu_item = watchlist_menu
+                self._watchlist_menu_item._menuitem.setSubmenu_(
+                    self._watchlist_menu_item._menu
+                )
+                self._watchlist_menu_item._menuitem.setEnabled_(True)
+            except Exception as e:
+                self.log(f"监控股票菜单更新失败: {e}", "ERROR")
 
             # ── 🔥 涨幅榜 ──
             try:
@@ -3852,11 +3569,11 @@ class StockMenuBar(rumps.App):
             except Exception as e:
                 self.log(f"涨跌停更新失败: {e}", "ERROR")
 
-            # ── 📈 指标策略 ──
+            # ── 选股 ──
             try:
-                self.update_indicator_menu()
+                self.update_selection_menu()
             except Exception as e:
-                self.log(f"指标策略更新失败: {e}", "ERROR")
+                self.log(f"选股菜单更新失败: {e}", "ERROR")
 
             # ── 📦 持仓信息 ──
             try:
@@ -3864,162 +3581,21 @@ class StockMenuBar(rumps.App):
             except Exception as e:
                 self.log(f"今日报告菜单更新失败: {e}\n{traceback.format_exc()}", "ERROR")
 
-            # ── 浮动窗口 ──
+            # ── 刘海屏替代窗口 ──
             try:
-                self._update_floating_window(menu)
+                self._update_menu_bar_fallback(menu)
             except Exception as e:
-                self.log(f"浮动窗口更新失败: {e}", "ERROR")
+                self.log(f"菜单替代窗口更新失败: {e}", "ERROR")
 
         except Exception as e:
             self.log(f"更新显示失败: {e}", "ERROR")
             self.log(traceback.format_exc(), "ERROR")
 
-    def _update_floating_window(self, menu):
-        """用 _build_menu_data 的数据更新浮动窗口"""
-        def _fmt_price(p):
-            return f"{p:.0f}" if p >= 100 else f"{p:.2f}"
-
-        def _pct_color(pct):
-            if pct > 0:
-                return "▲", "red"
-            elif pct < 0:
-                return "▼", "green"
-            return "─", "gray"
-
-        # ── 紧凑模式：指数 + 个股 + 量能 ──
-        clines = [" 📈 A股实时监控", " ─────────────────"]
-        ccol = [(clines[0], "header"), (clines[1], "gray")]
-        buy_count = menu.get("indicator", {}).get("buy_count", 0)
-        if buy_count:
-            buy_line = f" 📋 今日曾提醒{buy_count}只（非当前买点）｜展开→指标策略"
-            clines.append(buy_line)
-            ccol.append((buy_line, "red"))
-
-        idx_items = menu.get("index", {}).get("items", [])
-        if not idx_items:
-            empty_line = " 暂无行情数据 · 等待刷新"
-            clines.append(empty_line)
-            ccol.append((empty_line, "gray"))
-        for it in idx_items:
-            arrow, color = _pct_color(it['pct'])
-            l = f" {it['name']}  {_fmt_price(it['price'])}  {arrow}{abs(it['pct']):.2f}%"
-            clines.append(l); ccol.append((l, color))
-
-        stk = menu.get("stock", {}).get("items", [])
-        if stk:
-            clines.append(" · · · · · · · · · · · · · ·")
-            ccol.append((" · · · · · · · · · · · · · ·", "gray"))
-            for it in stk:
-                arrow, color = _pct_color(it['pct'])
-                l = f" {it['name']}  {_fmt_price(it['price'])}  {arrow}{abs(it['pct']):.2f}%"
-                clines.append(l); ccol.append((l, color))
-
-        for line in self._market_turnover_lines():
-            display_line = f" {line}"
-            clines.append(display_line)
-            ccol.append((display_line, "gray"))
-
-        compact_text = "\n".join(clines) if clines else " 等待数据..."
-        self.floating_window.set_compact(compact_text, ccol)
-
-        # ── 菜单数据：把 menu 转成浮动窗口需要的格式 ──
-        fw_menu = {}
-
-        def _to_fw_items(items, name_key="name", pct_key="pct"):
-            result = []
-            for it in items:
-                pct = it[pct_key]
-                arrow, color = _pct_color(pct)
-                result.append({
-                    "name": it[name_key],
-                    "value": f"{arrow}{abs(pct):.2f}%",
-                    "color": color,
-                })
-            return result
-
-        # 指数
-        if idx_items:
-            fw_idx = []
-            for it in idx_items:
-                arrow, color = _pct_color(it['pct'])
-                fw_idx.append({
-                    "name": it['name'],
-                    "value": f"{_fmt_price(it['price'])} {arrow}{abs(it['pct']):.2f}%",
-                    "color": color,
-                })
-            fw_menu["index"] = {"title": "📊 指数", "items": fw_idx}
-
-        # 个股
-        if stk:
-            fw_stk = []
-            for it in stk:
-                arrow, color = _pct_color(it['pct'])
-                fw_stk.append({
-                    "name": it['name'],
-                    "value": f"{_fmt_price(it['price'])} {arrow}{abs(it['pct']):.2f}%",
-                    "color": color,
-                })
-            fw_menu["stock"] = {"title": "📈 个股", "items": fw_stk}
-
-        market_turnover_lines = self._market_turnover_lines()
-        fw_menu["volume"] = {
-            "title": "💰 量能",
-            "items": [{
-                "name": "市场总成交",
-                "value": "  ·  ".join(market_turnover_lines),
-                "color": "white",
-            }],
-        }
-
-        # 涨幅榜
-        top = menu.get("top_sector", {}).get("items", [])
-        if top:
-            fw_menu["top_sector"] = {"title": "🔥 涨幅榜", "items": _to_fw_items(top)}
-
-        # 跌幅榜
-        bottom = menu.get("bottom_sector", {}).get("items", [])
-        if bottom:
-            fw_menu["bottom_sector"] = {"title": "💧 跌幅榜", "items": _to_fw_items(bottom)}
-
-        # 概念板块
-        concepts = menu.get("concept", {}).get("items", [])
-        if concepts:
-            fw_menu["concept"] = {"title": "🤖 概念板块", "items": _to_fw_items(concepts)}
-
-        # 涨跌停
-        limit = menu.get("limit", {})
-        limit_items = []
-        for it in limit.get("items", []):
-            pct = it.get("pct", 0)
-            arrow, color = _pct_color(pct)
-            name = it["name"]
-            boards = it.get("boards", "")
-            suffix = f" [{boards}]" if boards else ""
-            limit_items.append({
-                "name": name,
-                "value": f"{arrow}{abs(pct):.2f}%{suffix}" if pct != 0 else "",
-                "color": color if pct != 0 else "white",
-            })
-        if limit_items:
-            fw_menu["limit"] = {"title": "📊 涨跌停", "items": limit_items}
-
-        # 指标策略
-        ind_titles = menu.get("indicator", {}).get("items", [])
-        if ind_titles:
-            ind_items = []
-            for t in ind_titles:
-                ind_items.append({"name": t, "value": "", "color": indicator_color(t)})
-            fw_menu["indicator"] = {"title": menu.get("indicator", {}).get("title", "📈 指标策略"), "items": ind_items}
-
-        # 盘面总结
-        summary_items = menu.get("summary", {}).get("items", [])
-        if summary_items:
-            fw_menu["summary"] = {"title": "📋 盘面总结", "items": [
-                {"name": it["name"], "value": "", "color": "white"}
-                for it in summary_items
-            ]}
-
-        self.floating_window.set_menu_data(fw_menu)
+    def _update_menu_bar_fallback(self, menu):
+        """用当前菜单数据更新刘海屏替代窗口摘要。"""
+        self.menu_bar_fallback.set_summary(
+            build_summary(menu, self._market_turnover_lines())
+        )
 
     def start_update_timer(self):
         """启动定时更新"""
@@ -4567,7 +4143,7 @@ class StockMenuBar(rumps.App):
         service = getattr(self, "_entry_review", None)
         if service is not None:
             self._entry_review_call("set_enabled", not service.enabled)
-            self.update_indicator_menu()
+            self.update_selection_menu()
 
     def show_entry_review_report(self, _):
         service = getattr(self, "_entry_review", None)
@@ -4630,6 +4206,7 @@ class StockMenuBar(rumps.App):
         try:
             self.maybe_refresh_observation_pool()
             self._maybe_check_observation_entries()
+            self.maybe_refresh_today_headlines()
             # 首次加载不受时间限制，之后仅在交易时段刷新
             is_first_load = not hasattr(self, '_first_load_done')
             if not is_first_load and not self._is_trading_hours():
@@ -7037,7 +6614,7 @@ class StockMenuBar(rumps.App):
         危险级别还会额外：
         - 用 TimeSensitive 中断等级，穿透专注模式（否则只进通知列表不弹横幅）
         - 播放独立醒目音效
-        - 弹「知道了，我去处理」告警对话框（框内标注级别），完全不依赖通知系统。
+        - 弹「知道了」告警对话框（框内标注级别），完全不依赖通知系统。
 
         popup_body：屏幕打断层（告警对话框）的正文，缺省复用
         body。真预警时两边本就该显示同一份告警内容；只有自测这类"验通道
@@ -7183,14 +6760,14 @@ class StockMenuBar(rumps.App):
         except Exception as error:
             self.log(f"{tag} 调度失败: {error}", "ERROR")
 
-    def _show_alert_dialog(self, title, subtitle, body, level_name):
-        """统一的告警对话框（NSAlert 模态，按钮「知道了，我去处理」）。
+    def _show_alert_dialog(self, title, subtitle, body, level_name, label=None):
+        """统一的告警对话框（NSAlert 模态，按钮「知道了」）。
 
         2026-10-22 起取代置顶横幅卡片：danger/crash 与观察类打断都走它，
         级别写进标题前缀（【危险提醒】【系统性风险】等）。
         必须在主线程弹（后台线程建的 NSAlert 不响应点击 / 会触发线程断言）。
         """
-        label = self._LEVEL_LABELS.get(level_name, str(level_name))
+        label = label or self._LEVEL_LABELS.get(level_name, str(level_name))
         informative = f"{subtitle}\n\n{body}" if subtitle else str(body or "")
 
         def _modal():
@@ -7204,7 +6781,7 @@ class StockMenuBar(rumps.App):
                 alert.setAlertStyle_(AppKit.NSAlertStyleInformational)
             else:
                 alert.setAlertStyle_(AppKit.NSAlertStyleWarning)
-            alert.addButtonWithTitle_('知道了，我去处理')
+            alert.addButtonWithTitle_('知道了')
             self.log(f"告警对话框已弹出 level={level_name}，等待用户确认", "INFO")
             alert.runModal()
 
@@ -7216,7 +6793,7 @@ class StockMenuBar(rumps.App):
 
         com.apple.python3 的 timeSensitiveSetting=0，TimeSensitive 会被降级，
         专注模式下通知只进列表不弹横幅。所以这里叠三层，第一层是主通道：
-        1. 告警对话框（NSAlert「知道了，我去处理」，框内标注级别；
+        1. 告警对话框（NSAlert「知道了」，框内标注级别；
            2026-10-22 起取代置顶横幅卡片，danger/crash 统一用它）
         2. 独立醒目音效 + Dock 图标弹跳
         对话框受 180s 冷却 / 级别抬升规则节流——盘中连环触发时不能
@@ -7779,6 +7356,7 @@ class StockMenuBar(rumps.App):
         try:
             self._show_alert_dialog(
                 title, f"现价 {alert.price:.2f}", body, "warning",
+                label="盘中异动",
             )
         except Exception as error:
             self.log(f"盘中点火弹窗失败: {error}", "WARNING")
@@ -7832,6 +7410,8 @@ class StockMenuBar(rumps.App):
         permissions=None,
         trend=None,
         high_position=None,
+        historical_context=None,
+        volume_inputs=None,
     ):
         intent = self._intraday_policy_intent(signal)
         if intent == "hold":
@@ -7879,6 +7459,13 @@ class StockMenuBar(rumps.App):
             evidence = build_timeframe_evidence(
                 bars15, bars30, price=price, support=support,
                 resistance=resistance, now=now, quote_date=trade_date,
+                historical_context=historical_context,
+            )
+            volume_context = build_intraday_volume_context(
+                **(volume_inputs or {}),
+                bars15=bars15,
+                price=price,
+                support=support,
             )
         except Exception as error:
             self.log(f"盘中双周期证据获取失败 {name}: {error}", "WARNING")
@@ -7886,6 +7473,13 @@ class StockMenuBar(rumps.App):
             evidence = build_timeframe_evidence(
                 bars15, bars30, price=price, support=support,
                 resistance=resistance, now=now, quote_date=trade_date,
+                historical_context=historical_context,
+            )
+            volume_context = build_intraday_volume_context(
+                **(volume_inputs or {}),
+                bars15=[],
+                price=price,
+                support=support,
             )
 
         try:
@@ -7902,17 +7496,24 @@ class StockMenuBar(rumps.App):
             sellable_quantity=int(summary.get("sellable_quantity") or 0),
             today_locked_quantity=int(summary.get("today_locked_quantity") or 0),
             buy_capacity_quantity=int(buy_capacity_quantity or 0),
+            ledger_consistent=bool(summary.get("consistent", True)),
         )
-        invalidation = support if intent == "buy" else 0.0
+        invalidation = (
+            support
+            if intent == "buy"
+            else float((historical_context or {}).get("invalidation_price") or 0)
+        )
         decision = evaluate_trade_action(
             intent, evidence, eligibility, invalidation_price=invalidation,
             permissions=permissions, trend=trend, high_position=high_position,
+            volume_context=volume_context,
         )
 
         if decision.action == DecisionAction.WAIT:
             guarded = guard_actionable_copy(
                 intent, decision.message, eligibility, evidence,
                 trade_date=trade_date, invalidation_price=invalidation,
+                max_quantity=decision.max_sell_quantity,
             )
             tactics = getattr(self, "_intraday_tactics", None)
             if tactics is not None:
@@ -7931,6 +7532,7 @@ class StockMenuBar(rumps.App):
             guarded = guard_actionable_copy(
                 intent, decision.message, eligibility, evidence,
                 trade_date=trade_date, invalidation_price=invalidation,
+                max_quantity=decision.max_sell_quantity,
             )
             return IntradaySignal(
                 signal_type=IntradaySignalType.NEXT_DAY_REVIEW,
@@ -7956,6 +7558,7 @@ class StockMenuBar(rumps.App):
             guarded = guard_actionable_copy(
                 "risk_exit", decision.message, eligibility, evidence,
                 trade_date=trade_date,
+                max_quantity=decision.max_sell_quantity,
             )
             return IntradaySignal(
                 signal_type=signal.signal_type,
@@ -7963,6 +7566,21 @@ class StockMenuBar(rumps.App):
                 body=guarded.text,
                 notification_body=(
                     f"15分钟风险确认｜今日可卖{decision.max_sell_quantity}股"
+                    "｜新仓T+1不纳入"
+                ),
+            )
+        if decision.action == DecisionAction.RISK_REDUCE:
+            guarded = guard_actionable_copy(
+                "risk_reduce", decision.message, eligibility, evidence,
+                trade_date=trade_date,
+                max_quantity=decision.max_sell_quantity,
+            )
+            return IntradaySignal(
+                signal_type=IntradaySignalType.EXIT_WINDOW,
+                title=f"🟠 {name} 分批减仓观察",
+                body=guarded.text,
+                notification_body=(
+                    f"连续15分钟风险确认｜首批最多减{decision.max_sell_quantity}股"
                     "｜新仓T+1不纳入"
                 ),
             )
@@ -8092,6 +7710,20 @@ class StockMenuBar(rumps.App):
                 "trend": entry.get("trend_assessment"),
                 "high_position": entry.get("high_position"),
             }
+            daily_report = getattr(self, "_last_daily_report", None) or {}
+            daily_meta = daily_report.get("meta") or {}
+            overview_date = str(daily_meta.get("quote_date") or "")[:10]
+            daily_overview = (
+                daily_report.get("overview")
+                if not overview_date or overview_date == str(trade_date or "")[:10]
+                else None
+            )
+            historical_context = self._daily_risk_context_cache.get(
+                code,
+                trade_date,
+                result,
+                daily_overview,
+            )
 
             # ── 记录tick数据用于置信度计算 ──
             conditions = {
@@ -8225,6 +7857,13 @@ class StockMenuBar(rumps.App):
                     permissions=entry.get("trade_permissions"),
                     trend=entry.get("trend_assessment"),
                     high_position=entry.get("high_position"),
+                    historical_context=historical_context,
+                    volume_inputs={
+                        "market_turnover": market_context["values"].get("predicted_market_turnover"),
+                        "recent_market_turnovers": market_context["values"].get("recent_market_turnovers") or (),
+                        "stock_volume_ratio": vr,
+                        "price_change_pct": change_pct,
+                    },
                 )
                 notification_body = signal.notification_body or signal.body
                 if signal.signal_type == IntradaySignalType.TRADE_WAIT:
@@ -9172,6 +8811,40 @@ class StockMenuBar(rumps.App):
             self.log(f"打开个股分析失败: {error}", "ERROR")
             self._alert(title="个股分析", message=text[:500])
 
+    def show_watchlist_report(self, _):
+        rows = []
+        for item in self.watchlist:
+            data = self.stock_data.get(item["code"])
+            if not data:
+                rows.append(f"{item['name']}  暂无行情")
+                continue
+            pct = data.get("change_pct", 0)
+            arrow = "▲" if pct > 0 else "▼" if pct < 0 else "─"
+            rows.append(
+                f"{item['name']}  {data.get('price', 0):.2f}  "
+                f"{arrow}{abs(pct):.2f}%"
+            )
+        self._alert(
+            title="监控股票",
+            message="\n".join(rows) if rows else "暂无监控股票",
+        )
+
+    def show_watchlist_stock(self, _, code=None, name=None):
+        data = self.stock_data.get(code)
+        if not data:
+            self._alert(title="监控股票", message=f"{name or code} 暂无行情")
+            return
+        pct = data.get("change_pct", 0)
+        arrow = "▲" if pct > 0 else "▼" if pct < 0 else "─"
+        self._alert(
+            title=f"{name or code} 行情",
+            message=(
+                f"代码：{code}\n"
+                f"价格：{data.get('price', 0):.2f}\n"
+                f"涨跌幅：{arrow}{abs(pct):.2f}%"
+            ),
+        )
+
     @rumps.clicked("🔍 个股分析")
     def show_stock_technical_analysis(self, _):
         """输入股票名称或代码，按需生成单股技术分析。"""
@@ -9894,11 +9567,11 @@ class StockMenuBar(rumps.App):
                     "请检查代码是否正确。"
         )
 
-    @rumps.clicked("⚙️ 设置")
+    @rumps.clicked(SETTINGS_TITLE)
     def show_settings(self, _):
         """显示设置"""
         self._alert(
-            title="⚙️ 设置",
+            title=SETTINGS_TITLE,
             message=f"当前配置:\n\n"
                     f"• 更新间隔: {self.update_interval}秒\n"
                     f"• 监控股票: {len(self.watchlist)}只\n"
@@ -9907,30 +9580,59 @@ class StockMenuBar(rumps.App):
                     f"修改配置请编辑 stock_menubar.py"
         )
 
-    def _toggle_floating(self, _):
-        """切换浮动窗口显隐"""
-        self.floating_window.toggle_visible()
-        self._update_float_menu_title()
+    def _setup_screen_observer(self):
+        try:
+            from AppKit import NSApplicationDidChangeScreenParametersNotification
+            from Foundation import NSNotificationCenter
 
-    def _on_floating_closed(self):
-        """浮动窗口被 × 关闭时的回调"""
-        self._update_float_menu_title()
+            self._screen_observer = (
+                NSNotificationCenter.defaultCenter().addObserverForName_object_queue_usingBlock_(
+                    NSApplicationDidChangeScreenParametersNotification,
+                    None,
+                    None,
+                    lambda _note: self._dispatch_to_main(self.menu_bar_fallback.evaluate_screen),
+                )
+            )
+        except Exception as error:
+            self._screen_observer = None
+            self.log(f"显示器变化监听注册失败: {error}", "WARNING")
 
-    def _on_floating_mode_change(self):
-        """浮动窗口模式切换时的回调"""
-        self._update_float_menu_title()
+    def _setup_menu_tracking_observer(self):
+        try:
+            from AppKit import (
+                NSMenuDidBeginTrackingNotification,
+                NSMenuDidEndTrackingNotification,
+            )
+            from Foundation import NSNotificationCenter
 
-    def _update_float_menu_title(self):
-        mode = "菜单" if self.floating_window.expanded else "紧凑"
-        if self.floating_window.visible:
-            replace_menu_item_title(self._float_menu_item, f"📌 浮动窗口 ✓ ({mode})")
-        else:
-            replace_menu_item_title(self._float_menu_item, "📌 浮动窗口")
+            self._menu_tracking_observers = observe_menu_tracking(
+                self._menu_update_coordinator,
+                NSNotificationCenter.defaultCenter(),
+                NSMenuDidBeginTrackingNotification,
+                NSMenuDidEndTrackingNotification,
+            )
+        except Exception as error:
+            self._menu_tracking_observers = []
+            self.log(f"菜单展开监听注册失败: {error}", "WARNING")
 
     @rumps.clicked("❌ 退出")
     def quit_app(self, _):
         """退出应用"""
-        self.floating_window.close()
+        if self._screen_observer is not None:
+            try:
+                from Foundation import NSNotificationCenter
+                NSNotificationCenter.defaultCenter().removeObserver_(self._screen_observer)
+            except Exception as error:
+                self.log(f"显示器监听移除失败: {error}", "WARNING")
+        if self._menu_tracking_observers:
+            try:
+                from Foundation import NSNotificationCenter
+                center = NSNotificationCenter.defaultCenter()
+                for observer in self._menu_tracking_observers:
+                    center.removeObserver_(observer)
+            except Exception as error:
+                self.log(f"菜单展开监听移除失败: {error}", "WARNING")
+        self.menu_bar_fallback.close()
         rumps.quit_application()
 
 def main():

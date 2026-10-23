@@ -47,7 +47,7 @@ from entry_structure import EntryState, compute_entry_input, evaluate
 
 CACHE_PATH = "_backtest_bars_cache.json"
 RESULT_PATH = "_backtest_entry_structure.json"   # 可被 --out 覆盖
-HORIZONS = (5, 10, 20)          # 前瞻窗口（交易日）
+HORIZONS = (1, 3, 5, 10, 20)    # 前瞻窗口（交易日）
 WARMUP = 30                     # 信号日之前的最少 K 线数
 API_DELAY = 0.12                # 取数间隔，避免限流
 MIN_BARS_FOR_HORIZON = 25       # 保证 20 日前瞻可算
@@ -115,17 +115,26 @@ def fetch_universe(sample_size: int, seed: int) -> List[Tuple[str, str]]:
     注意：这是**当前在市**股票，不含已退市标的，存在生存偏差——
     回测结果应视为「上界」而非真实可得收益。
     """
-    import akshare as ak
+    try:
+        import akshare as ak
 
-    frame = ak.stock_info_a_code_name()
-    rows = []
-    for _, row in frame.iterrows():
-        code = str(row["code"]).zfill(6)
-        name = str(row["name"])
-        # 只要沪深主板/创业板/科创板，跳过北交所（数据源口径不同）
-        if code.startswith(("60", "68", "00", "30")):
-            prefix = "sh" if code.startswith(("60", "68")) else "sz"
-            rows.append((prefix + code, name))
+        frame = ak.stock_info_a_code_name()
+        rows = []
+        for _, row in frame.iterrows():
+            code = str(row["code"]).zfill(6)
+            name = str(row["name"])
+            # 只要沪深主板/创业板/科创板，跳过北交所（数据源口径不同）
+            if code.startswith(("60", "68", "00", "30")):
+                prefix = "sh" if code.startswith(("60", "68")) else "sz"
+                rows.append((prefix + code, name))
+    except Exception:
+        cached = [
+            code for code, bars in load_cache().items()
+            if code != "sh000001"
+            and code.startswith(("sh60", "sh68", "sz00", "sz30"))
+            and isinstance(bars, list) and len(bars) >= 60
+        ]
+        rows = [(code, code) for code in sorted(cached)]
     random.Random(seed).shuffle(rows)
     return rows[:sample_size]
 
@@ -147,6 +156,8 @@ class SignalRecord:
     stop_ret: Optional[float] = None                       # 触发失效位离场的收益
     is_state_head: bool = False                            # 状态片段首日
     is_weak_head: bool = False                             # 趋势转弱升沿
+    forward_close_path: List[float] = field(default_factory=list)
+    max_drawdown_5d: Optional[float] = None
 
 
 def classify_states(bars: List[dict], benchmark_above: Dict[str, bool]) -> List[SignalRecord]:
@@ -199,6 +210,14 @@ def attach_forward_returns(
         if t is None:
             continue
         base = closes[t]
+        record.forward_close_path = closes[t:min(t + 6, len(closes))]
+        peak = None
+        max_drawdown = 0.0
+        for close in record.forward_close_path:
+            peak = close if peak is None else max(peak, close)
+            if peak > 0:
+                max_drawdown = max(max_drawdown, (peak - close) / peak)
+        record.max_drawdown_5d = max_drawdown
         for horizon in HORIZONS:
             end = t + horizon
             if end < len(closes) and base > 0:
@@ -253,6 +272,26 @@ def summarize(records: List[SignalRecord]) -> dict:
             1 for r in stopped if r.fwd.get(20, 0) > 0
         ),
     }
+    eligible_records = [
+        record for record in records
+        if (
+            record.state in {EntryState.BREAKOUT.name, EntryState.PULLBACK_M20.name}
+            and not record.trend_weak
+            and record.benchmark_ok is not False
+        )
+    ]
+    eligible_not_promoted = sum(1 for record in eligible_records if not record.can_buy)
+    out["eligible"] = len(eligible_records)
+    out["eligible_not_promoted"] = eligible_not_promoted
+    out["miss_rate"] = (
+        eligible_not_promoted / len(eligible_records)
+        if eligible_records else None
+    )
+    drawdowns = [
+        record.max_drawdown_5d for record in records
+        if record.max_drawdown_5d is not None
+    ]
+    out["max_drawdown_5d"] = max(drawdowns) if drawdowns else None
     return out
 
 
@@ -399,7 +438,40 @@ def format_report(payload: dict) -> str:
             )
 
     lines.append("")
-    lines.append("【五】如何读这份报告")
+    lines.append("【五】候选晋级质量（1/3/5日）")
+    lines.append("-" * 72)
+    lines.append(
+        f"{'分组':<22}{'1日均/胜率':>16}{'3日均/胜率':>16}{'5日均/胜率':>16}"
+        f"{'最大回撤':>10}{'合格':>8}{'错过':>8}{'错过率':>9}"
+    )
+    for label, key in [
+        ("基准（所有交易日）", "BASELINE"),
+        ("放量突破前高", EntryState.BREAKOUT.name),
+        ("突破·已晋级", EntryState.BREAKOUT.name + "_BUY"),
+        ("回踩上行M20", EntryState.PULLBACK_M20.name),
+        ("回踩·已晋级", EntryState.PULLBACK_M20.name + "_BUY"),
+    ]:
+        block = payload["stats"].get(key)
+        if not block:
+            continue
+        metrics = []
+        for horizon in (1, 3, 5):
+            stat = block.get(f"ret_{horizon}d")
+            if stat:
+                metrics.append(f"{_pct(stat['avg'])}/{_rate(stat['win_rate'])}")
+            else:
+                metrics.append("—/—")
+        drawdown = block.get("max_drawdown_5d")
+        miss_rate = block.get("miss_rate")
+        lines.append(
+            f"{label:<22}{metrics[0]:>16}{metrics[1]:>16}{metrics[2]:>16}"
+            f"{_rate(drawdown):>10}{block.get('eligible', 0):>8}"
+            f"{block.get('eligible_not_promoted', 0):>8}{_rate(miss_rate):>9}"
+        )
+    lines.append("合格=通过普通日线结构门槛；错过=合格但未晋级；错过率=错过/合格。")
+
+    lines.append("")
+    lines.append("【六】如何读这份报告")
     lines.append("-" * 72)
     lines.append("· 胜率只有在高于「基准」时才有意义；单边上涨的年份里基准本身可能就 55%+。")
     lines.append("· 盈亏比（平均盈利÷平均亏损）要和胜率一起看：胜率 45% + 盈亏比 1.8 优于 60% + 0.8。")
